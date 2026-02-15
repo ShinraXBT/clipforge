@@ -8,6 +8,7 @@ import os
 import re
 import uuid
 import time
+import mimetypes
 import shutil
 from pathlib import Path
 from urllib.parse import urlparse
@@ -24,8 +25,31 @@ TEMP_DIR.mkdir(exist_ok=True)
 _rate_limit = {}  # ip -> (count, window_start)
 RATE_LIMIT_MAX = 15       # max requests per window
 RATE_LIMIT_WINDOW = 60    # window in seconds
+RATE_LIMIT_MAX_ENTRIES = 10000  # prevent unbounded growth
 MAX_URL_LENGTH = 2048
 MAX_FILE_SIZE = 100 * 1024 * 1024  # 100 MB
+
+
+# ── Security: HTTP response headers ──────────────────────────────────────────
+@app.after_request
+def set_security_headers(response):
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["X-XSS-Protection"] = "1; mode=block"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'self'; "
+        "script-src 'self' 'unsafe-inline'; "
+        "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
+        "font-src https://fonts.gstatic.com; "
+        "img-src 'self' https: data:; "
+        "frame-src https://www.youtube.com; "
+        "connect-src 'self'"
+    )
+    if request.is_secure:
+        response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+    return response
 
 # Allowed hostname patterns per platform (SSRF protection)
 ALLOWED_HOSTS = {
@@ -37,8 +61,15 @@ ALLOWED_HOSTS = {
 
 
 def check_rate_limit(ip):
-    """Returns True if rate limited."""
+    """Returns True if rate limited. Prunes stale entries to prevent unbounded growth."""
     now = time.time()
+
+    # Prune stale entries periodically
+    if len(_rate_limit) > RATE_LIMIT_MAX_ENTRIES:
+        stale_keys = [k for k, (_, ws) in _rate_limit.items() if now - ws > RATE_LIMIT_WINDOW]
+        for k in stale_keys:
+            del _rate_limit[k]
+
     if ip in _rate_limit:
         count, window_start = _rate_limit[ip]
         if now - window_start > RATE_LIMIT_WINDOW:
@@ -148,6 +179,9 @@ def safe_ydl_opts(extra_opts=None):
         "no_color": True,
         "geo_bypass": False,
         "max_filesize": MAX_FILE_SIZE,
+        # Prevent loading config files from disk
+        "ignoreerrors": False,
+        "no_config": True,
     }
     if extra_opts:
         opts.update(extra_opts)
@@ -155,10 +189,13 @@ def safe_ydl_opts(extra_opts=None):
 
 
 def find_downloaded_file(directory, prefix):
-    """Find the first file in directory starting with prefix."""
+    """Find the first file in directory starting with prefix, with path traversal protection."""
+    resolved_dir = directory.resolve()
     for f in directory.iterdir():
         if f.name.startswith(prefix) and f.is_file():
-            return f
+            # Ensure file is actually inside the expected directory
+            if f.resolve().parent == resolved_dir:
+                return f
     return None
 
 
@@ -222,10 +259,10 @@ def video_info():
             "thumbnail": info.get("thumbnail", ""),
             "channel": info.get("uploader") or info.get("uploader_id") or "Unknown",
         })
-    except yt_dlp.utils.DownloadError as e:
-        return jsonify({"error": f"Could not fetch video: {str(e)[:200]}"}), 400
-    except Exception as e:
-        return jsonify({"error": str(e)[:300]}), 500
+    except yt_dlp.utils.DownloadError:
+        return jsonify({"error": "Could not fetch video info. The URL may be invalid or the video may be unavailable."}), 400
+    except Exception:
+        return jsonify({"error": "An unexpected error occurred while fetching video info."}), 500
 
 
 # ── API: Download (full video, no trim) ──────────────────────────────────────
@@ -273,19 +310,20 @@ def download_full():
             return jsonify({"error": "File too large (>100MB)."}), 413
 
         ext = dl_file.suffix or ".mp4"
+        mime = mimetypes.guess_type(dl_file.name)[0] or "application/octet-stream"
         return send_file(
             str(dl_file),
             as_attachment=True,
             download_name=f"{platform}_{job_id}{ext}",
-            mimetype="video/mp4",
+            mimetype=mime,
         )
 
-    except yt_dlp.utils.DownloadError as e:
+    except yt_dlp.utils.DownloadError:
         cleanup_job_dir(job_dir)
-        return jsonify({"error": f"Download failed: {str(e)[:300]}"}), 500
-    except Exception as e:
+        return jsonify({"error": "Download failed. The video may be unavailable or restricted."}), 500
+    except Exception:
         cleanup_job_dir(job_dir)
-        return jsonify({"error": str(e)[:300]}), 500
+        return jsonify({"error": "An unexpected error occurred during download."}), 500
 
 
 # ── API: Trim (works for any platform with duration) ─────────────────────────
@@ -349,19 +387,20 @@ def trim_video():
             return jsonify({"error": "File too large (>100MB)."}), 413
 
         ext = clip_file.suffix or ".mp4"
+        mime = mimetypes.guess_type(clip_file.name)[0] or "application/octet-stream"
         return send_file(
             str(clip_file),
             as_attachment=True,
             download_name=f"clip_{job_id}{ext}",
-            mimetype="video/mp4",
+            mimetype=mime,
         )
 
-    except yt_dlp.utils.DownloadError as e:
+    except yt_dlp.utils.DownloadError:
         cleanup_job_dir(job_dir)
-        return jsonify({"error": f"Trim failed: {str(e)[:300]}"}), 500
-    except Exception as e:
+        return jsonify({"error": "Trim failed. The video may be unavailable or the format unsupported."}), 500
+    except Exception:
         cleanup_job_dir(job_dir)
-        return jsonify({"error": str(e)[:300]}), 500
+        return jsonify({"error": "An unexpected error occurred during trimming."}), 500
 
 
 # ── Frontend HTML ────────────────────────────────────────────────────────────
@@ -1102,7 +1141,7 @@ body::after {
       </div>
     </div>
     <div class="player-wrap" id="playerWrap">
-      <iframe id="ytPlayer" src="" allow="autoplay; encrypted-media" allowfullscreen></iframe>
+      <iframe id="ytPlayer" src="" allow="autoplay; encrypted-media" allowfullscreen sandbox="allow-scripts allow-same-origin allow-popups"></iframe>
     </div>
   </div>
 
@@ -1251,7 +1290,16 @@ async function loadVideo() {
     // Platform badge
     const badge = document.getElementById('platformBadge');
     badge.className = `platform-badge visible ${currentPlatform}`;
-    badge.innerHTML = `${PLATFORM_ICONS[currentPlatform] || ''} ${PLATFORM_LABELS[currentPlatform] || currentPlatform}`;
+    badge.textContent = '';
+    const iconHtml = PLATFORM_ICONS[currentPlatform];
+    if (iconHtml) {
+      const iconWrapper = document.createElement('span');
+      iconWrapper.innerHTML = iconHtml;  // safe: hardcoded SVG constants only
+      badge.appendChild(iconWrapper);
+    }
+    const labelSpan = document.createElement('span');
+    labelSpan.textContent = PLATFORM_LABELS[currentPlatform] || currentPlatform;
+    badge.appendChild(labelSpan);
 
     // Video meta
     document.getElementById('videoThumb').src = data.thumbnail || '';
@@ -1262,8 +1310,9 @@ async function loadVideo() {
     // Player — only YouTube gets embed
     const playerWrap = document.getElementById('playerWrap');
     const ytPlayer = document.getElementById('ytPlayer');
-    if (currentPlatform === 'youtube' && videoId) {
-      ytPlayer.src = `https://www.youtube.com/embed/${videoId}?rel=0&modestbranding=1`;
+    const safeVideoId = /^[a-zA-Z0-9_-]{11}$/.test(videoId) ? videoId : null;
+    if (currentPlatform === 'youtube' && safeVideoId) {
+      ytPlayer.src = `https://www.youtube.com/embed/${safeVideoId}?rel=0&modestbranding=1`;
       ytPlayer.style.display = '';
       const noEmbed = playerWrap.querySelector('.no-embed');
       if (noEmbed) noEmbed.remove();
@@ -1509,4 +1558,4 @@ document.getElementById('urlInput').addEventListener('keydown', e => {
 if __name__ == "__main__":
     print("\n  ClipForge — Video Downloader & Trimmer")
     print("  Running at http://localhost:5000\n")
-    app.run(debug=True, port=5000)
+    app.run(debug=False, port=5000)
