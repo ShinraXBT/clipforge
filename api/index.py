@@ -15,8 +15,15 @@ from urllib.parse import urlparse
 from flask import Flask, request, jsonify, send_file
 
 import yt_dlp
+from supabase import create_client
 
 app = Flask(__name__)
+
+# ── Supabase ─────────────────────────────────────────────────────────────────
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://yopxattfhvxackbnrblw.supabase.co")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InlvcHhhdHRmaHZ4YWNrYm5yYmx3Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzExNTMwMjMsImV4cCI6MjA4NjcyOTAyM30.JMroS3lPPk5uLhA_N3qzpVMoQSHNhuYfDYqRnCy925Y")
+SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InlvcHhhdHRmaHZ4YWNrYm5yYmx3Iiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3MTE1MzAyMywiZXhwIjoyMDg2NzI5MDIzfQ.M7kKleJL-zz9nmt6pXZjZg_LKBRLakoeydXbx498IOc")
+sb = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
 TEMP_DIR = Path("/tmp/clipforge")
 TEMP_DIR.mkdir(exist_ok=True)
@@ -412,6 +419,202 @@ def trim_video():
     except Exception:
         cleanup_job_dir(job_dir)
         return jsonify({"error": "An unexpected error occurred during trimming."}), 500
+
+
+# ── Supabase: Upload to storage + save metadata ──────────────────────────────
+
+def upload_to_library(file_path, metadata):
+    """Upload a video file to Supabase Storage and save metadata to the clips table."""
+    try:
+        file_path = Path(file_path)
+        ext = file_path.suffix or ".mp4"
+        storage_name = f"{uuid.uuid4().hex[:16]}{ext}"
+        mime = mimetypes.guess_type(file_path.name)[0] or "application/octet-stream"
+
+        # Upload file to storage
+        with open(file_path, "rb") as f:
+            sb.storage.from_("clips").upload(
+                path=storage_name,
+                file=f.read(),
+                file_options={"content-type": mime},
+            )
+
+        # Get public URL
+        public_url = sb.storage.from_("clips").get_public_url(storage_name)
+
+        # Save metadata
+        row = {
+            "title": metadata.get("title", "Untitled")[:200],
+            "platform": metadata.get("platform", "unknown"),
+            "source_url": metadata.get("source_url", "")[:2048],
+            "thumbnail": metadata.get("thumbnail", "")[:2048],
+            "channel": metadata.get("channel", "")[:200],
+            "duration": metadata.get("duration", 0),
+            "trim_start": metadata.get("trim_start"),
+            "trim_end": metadata.get("trim_end"),
+            "mode": metadata.get("mode", "download"),
+            "file_path": storage_name,
+            "file_size": file_path.stat().st_size,
+            "file_ext": ext,
+        }
+
+        result = sb.table("clips").insert(row).execute()
+        return {"success": True, "url": public_url, "id": result.data[0]["id"] if result.data else None}
+    except Exception as e:
+        return {"success": False, "error": str(e)[:200]}
+
+
+# ── API: Save to Library (after download/trim) ───────────────────────────────
+
+@app.route("/api/save-to-library", methods=["POST"])
+def save_to_library():
+    """Download (and optionally trim) a video, then upload to Supabase."""
+    cleanup_old_files()
+
+    client_ip = request.headers.get("X-Forwarded-For", request.remote_addr or "unknown").split(",")[0].strip()
+    if check_rate_limit(client_ip):
+        return jsonify({"error": "Too many requests. Please wait a moment."}), 429
+
+    data = request.get_json(silent=True)
+    if not data:
+        return jsonify({"error": "Invalid request body."}), 400
+
+    url = data.get("url", "")
+    mode = data.get("mode", "download")
+    title = data.get("title", "Untitled")
+    platform_name = data.get("platform", "")
+    thumbnail = data.get("thumbnail", "")
+    channel = data.get("channel", "")
+    vid_duration = data.get("duration", 0)
+
+    platform, err = validate_url(url)
+    if err:
+        return jsonify({"error": err}), 400
+
+    job_id = uuid.uuid4().hex[:12]
+    job_dir = TEMP_DIR / job_id
+    job_dir.mkdir(exist_ok=True)
+
+    try:
+        if mode == "trim":
+            start_time = data.get("start", "0:00")
+            end_time = data.get("end", "0:00")
+            start_sec = time_to_seconds(start_time)
+            end_sec = time_to_seconds(end_time)
+
+            if start_sec is None or end_sec is None:
+                return jsonify({"error": "Invalid time format."}), 400
+            if end_sec - start_sec <= 0:
+                return jsonify({"error": "End time must be after start time."}), 400
+            if end_sec - start_sec > 600:
+                return jsonify({"error": "Clips limited to 10 minutes."}), 400
+
+            output_template = str(job_dir / "clip.%(ext)s")
+            opts = safe_ydl_opts({
+                "format": "best[ext=mp4][height<=720]/best[height<=720]/best",
+                "outtmpl": output_template,
+                "download_ranges": yt_dlp.utils.download_range_func(None, [(start_sec, end_sec)]),
+                "force_keyframes_at_cuts": True,
+            })
+
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                ydl.download([url])
+
+            dl_file = find_downloaded_file(job_dir, "clip")
+        else:
+            output_template = str(job_dir / "video.%(ext)s")
+            opts = safe_ydl_opts({
+                "format": "best[ext=mp4]/best",
+                "outtmpl": output_template,
+            })
+
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                ydl.download([url])
+
+            dl_file = find_downloaded_file(job_dir, "video")
+
+        if not dl_file:
+            return jsonify({"error": "Downloaded file not found."}), 500
+
+        if dl_file.stat().st_size > MAX_FILE_SIZE:
+            cleanup_job_dir(job_dir)
+            return jsonify({"error": "File too large (>100MB)."}), 413
+
+        # Upload to Supabase
+        result = upload_to_library(dl_file, {
+            "title": title,
+            "platform": platform,
+            "source_url": url,
+            "thumbnail": thumbnail,
+            "channel": channel,
+            "duration": vid_duration,
+            "trim_start": data.get("start") if mode == "trim" else None,
+            "trim_end": data.get("end") if mode == "trim" else None,
+            "mode": mode,
+        })
+
+        cleanup_job_dir(job_dir)
+
+        if not result["success"]:
+            return jsonify({"error": f"Upload failed: {result['error']}"}), 500
+
+        return jsonify({
+            "success": True,
+            "url": result["url"],
+            "id": result["id"],
+        })
+
+    except yt_dlp.utils.DownloadError:
+        cleanup_job_dir(job_dir)
+        return jsonify({"error": "Download failed. The video may be unavailable."}), 500
+    except Exception:
+        cleanup_job_dir(job_dir)
+        return jsonify({"error": "An unexpected error occurred."}), 500
+
+
+# ── API: Library (list / delete) ──────────────────────────────────────────────
+
+@app.route("/api/library", methods=["GET"])
+def get_library():
+    """Return all saved clips, newest first."""
+    try:
+        result = sb.table("clips").select("*").order("created_at", desc=True).limit(100).execute()
+        clips = result.data or []
+        # Add public URL to each clip
+        for clip in clips:
+            clip["download_url"] = sb.storage.from_("clips").get_public_url(clip["file_path"])
+        return jsonify({"clips": clips})
+    except Exception:
+        return jsonify({"clips": [], "error": "Could not load library."}), 500
+
+
+@app.route("/api/library/<clip_id>", methods=["DELETE"])
+def delete_clip(clip_id):
+    """Delete a clip from storage and database."""
+    # Validate UUID format
+    if not re.match(r'^[a-f0-9-]{36}$', clip_id):
+        return jsonify({"error": "Invalid clip ID."}), 400
+
+    try:
+        # Get the clip to find the file path
+        result = sb.table("clips").select("file_path").eq("id", clip_id).execute()
+        if not result.data:
+            return jsonify({"error": "Clip not found."}), 404
+
+        file_path = result.data[0]["file_path"]
+
+        # Delete from storage
+        try:
+            sb.storage.from_("clips").remove([file_path])
+        except Exception:
+            pass  # Storage file may already be gone
+
+        # Delete from database
+        sb.table("clips").delete().eq("id", clip_id).execute()
+
+        return jsonify({"success": True})
+    except Exception:
+        return jsonify({"error": "Could not delete clip."}), 500
 
 
 # ── Frontend HTML ────────────────────────────────────────────────────────────
@@ -1074,6 +1277,172 @@ body::after {
   margin-top: 0.75rem;
 }
 
+/* ── Save to Library Button ────────────────────── */
+.btn-save-library {
+  display: inline-block;
+  padding: 0.7rem 1.8rem;
+  background: var(--bg-elevated);
+  color: var(--accent);
+  border: 1px solid var(--accent);
+  border-radius: 10px;
+  font-family: 'Outfit', sans-serif;
+  font-size: 0.85rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.25s;
+  margin-top: 0.5rem;
+}
+.btn-save-library:hover {
+  background: var(--accent-dim);
+  transform: translateY(-1px);
+  box-shadow: 0 4px 16px var(--accent-glow);
+}
+.btn-save-library:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+  transform: none;
+}
+.btn-save-library.saved {
+  background: var(--accent-dim);
+  border-color: var(--accent);
+  pointer-events: none;
+}
+
+/* ── Library ───────────────────────────────────── */
+.library-section {
+  margin-top: 2rem;
+  animation: fadeSlideIn 0.8s ease-out backwards;
+  animation-delay: 0.2s;
+}
+
+.library-stats {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.7rem;
+  color: var(--text-muted);
+  margin-bottom: 1rem;
+}
+
+.library-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  gap: 1rem;
+}
+
+.library-empty {
+  grid-column: 1 / -1;
+  text-align: center;
+  padding: 3rem 1rem;
+  color: var(--text-secondary);
+  font-size: 0.9rem;
+}
+
+.clip-card {
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  overflow: hidden;
+  transition: all 0.25s;
+  animation: fadeSlideIn 0.4s ease-out backwards;
+}
+.clip-card:hover {
+  border-color: var(--border-light);
+  transform: translateY(-2px);
+  box-shadow: 0 8px 24px rgba(0,0,0,0.3);
+}
+
+.clip-card-thumb {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 16/9;
+  background: var(--bg-elevated);
+  overflow: hidden;
+}
+.clip-card-thumb img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+.clip-card-thumb .clip-platform-tag {
+  position: absolute;
+  top: 8px;
+  left: 8px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.55rem;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  padding: 0.2rem 0.5rem;
+  border-radius: 4px;
+  text-transform: uppercase;
+}
+.clip-platform-tag.youtube { background: var(--yt); color: #fff; }
+.clip-platform-tag.twitter { background: var(--tw); color: #fff; }
+.clip-platform-tag.instagram { background: var(--ig); color: #fff; }
+.clip-platform-tag.tiktok { background: var(--tk); color: #000; }
+
+.clip-card-thumb .clip-mode-tag {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.55rem;
+  font-weight: 600;
+  padding: 0.2rem 0.5rem;
+  border-radius: 4px;
+  background: rgba(0,0,0,0.7);
+  color: var(--text-secondary);
+}
+
+.clip-card-body {
+  padding: 0.85rem;
+}
+.clip-card-body h4 {
+  font-size: 0.85rem;
+  font-weight: 600;
+  line-height: 1.3;
+  margin-bottom: 0.35rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+}
+.clip-card-body .clip-meta {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.6rem;
+  color: var(--text-muted);
+  margin-bottom: 0.6rem;
+}
+
+.clip-card-actions {
+  display: flex;
+  gap: 0.5rem;
+}
+.clip-card-actions a, .clip-card-actions button {
+  flex: 1;
+  padding: 0.45rem;
+  border-radius: 6px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.65rem;
+  font-weight: 600;
+  text-align: center;
+  cursor: pointer;
+  transition: all 0.2s;
+  text-decoration: none;
+}
+.clip-btn-dl {
+  background: var(--accent-dim);
+  color: var(--accent);
+  border: 1px solid var(--accent);
+}
+.clip-btn-dl:hover { background: var(--accent); color: var(--bg-deep); }
+
+.clip-btn-del {
+  background: transparent;
+  color: var(--text-muted);
+  border: 1px solid var(--border);
+}
+.clip-btn-del:hover { border-color: var(--danger); color: var(--danger); }
+
 /* ── Animations ─────────────────────────────────── */
 @keyframes fadeSlideIn {
   from { opacity: 0; transform: translateY(12px); }
@@ -1222,7 +1591,24 @@ body::after {
     <p style="color:var(--text-secondary);font-size:0.85rem;margin-bottom:0.5rem" id="downloadInfo"></p>
     <a class="btn-download" id="btnDownload" href="#">Download MP4</a>
     <br>
+    <button type="button" class="btn-save-library" id="btnSaveLibrary" onclick="saveToLibrary()">Save to Library</button>
+    <br>
     <button type="button" class="reset-link" onclick="resetAll()">Download another video</button>
+  </div>
+
+  <!-- Library -->
+  <div class="panel library-section" id="librarySection">
+    <div class="panel-label"><span class="dot"></span> My Library</div>
+    <div class="library-stats" id="libraryStats"></div>
+    <div class="library-grid" id="libraryGrid">
+      <div class="library-empty" id="libraryEmpty">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" style="width:40px;height:40px;color:var(--text-muted);margin-bottom:0.75rem">
+          <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>
+        </svg>
+        <p>No saved clips yet</p>
+        <p style="font-size:0.75rem;color:var(--text-muted)">Download or trim a video and save it to your library</p>
+      </div>
+    </div>
   </div>
 
 </div>
@@ -1572,6 +1958,12 @@ function resetAll() {
   dlBtn.href = '#';
   dlBtn.textContent = 'Download MP4';
 
+  // Reset save button
+  const saveBtn = document.getElementById('btnSaveLibrary');
+  saveBtn.disabled = false;
+  saveBtn.textContent = 'Save to Library';
+  saveBtn.classList.remove('saved');
+
   ['previewSection','timelineSection','actionSection','progressSection','downloadSection'].forEach(id =>
     document.getElementById(id).classList.remove('visible'));
   document.getElementById('modeToggle').classList.remove('visible');
@@ -1611,6 +2003,151 @@ function showError(id, msg) {
 document.getElementById('urlInput').addEventListener('keydown', e => {
   if (e.key === 'Enter') loadVideo();
 });
+
+// ── Library ─────────────────────────────────
+
+async function saveToLibrary() {
+  const btn = document.getElementById('btnSaveLibrary');
+  btn.disabled = true;
+  btn.textContent = 'Saving...';
+
+  const url = document.getElementById('urlInput').value.trim();
+  const body = {
+    url,
+    mode: currentMode,
+    title: document.getElementById('videoTitle').textContent,
+    platform: currentPlatform,
+    thumbnail: document.getElementById('videoThumb').src,
+    channel: document.getElementById('videoChannel').textContent,
+    duration: videoDuration,
+  };
+
+  if (currentMode === 'trim') {
+    body.start = document.getElementById('startInput').value.trim();
+    body.end = document.getElementById('endInput').value.trim();
+  }
+
+  try {
+    const resp = await fetch('/api/save-to-library', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const data = await resp.json();
+
+    if (!resp.ok) {
+      btn.textContent = 'Save Failed';
+      btn.disabled = false;
+      setTimeout(() => { btn.textContent = 'Save to Library'; }, 2000);
+      return;
+    }
+
+    btn.textContent = 'Saved!';
+    btn.classList.add('saved');
+    loadLibrary();
+  } catch (e) {
+    btn.textContent = 'Save Failed';
+    btn.disabled = false;
+    setTimeout(() => { btn.textContent = 'Save to Library'; }, 2000);
+  }
+}
+
+async function loadLibrary() {
+  try {
+    const resp = await fetch('/api/library');
+    const data = await resp.json();
+    renderLibrary(data.clips || []);
+  } catch (e) {
+    // silently fail
+  }
+}
+
+function renderLibrary(clips) {
+  const grid = document.getElementById('libraryGrid');
+  const empty = document.getElementById('libraryEmpty');
+  const stats = document.getElementById('libraryStats');
+
+  // Remove existing cards
+  grid.querySelectorAll('.clip-card').forEach(el => el.remove());
+
+  if (clips.length === 0) {
+    empty.style.display = '';
+    stats.textContent = '';
+    return;
+  }
+
+  empty.style.display = 'none';
+  const totalSize = clips.reduce((sum, c) => sum + (c.file_size || 0), 0);
+  stats.textContent = `${clips.length} clip${clips.length !== 1 ? 's' : ''} · ${formatFileSize(totalSize)}`;
+
+  clips.forEach((clip, i) => {
+    const card = document.createElement('div');
+    card.className = 'clip-card';
+    card.style.animationDelay = (i * 0.05) + 's';
+
+    const trimInfo = clip.trim_start && clip.trim_end
+      ? `${clip.trim_start} → ${clip.trim_end}`
+      : 'Full video';
+
+    const date = new Date(clip.created_at);
+    const dateStr = date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+
+    card.innerHTML = `
+      <div class="clip-card-thumb">
+        ${clip.thumbnail ? `<img src="${escapeAttr(clip.thumbnail)}" alt="${escapeAttr(clip.title)}">` : ''}
+        <span class="clip-platform-tag ${clip.platform}">${(PLATFORM_LABELS[clip.platform] || clip.platform)}</span>
+        <span class="clip-mode-tag">${trimInfo}</span>
+      </div>
+      <div class="clip-card-body">
+        <h4>${escapeHtml(clip.title)}</h4>
+        <div class="clip-meta">${escapeHtml(clip.channel || '')} · ${dateStr} · ${formatFileSize(clip.file_size || 0)}</div>
+        <div class="clip-card-actions">
+          <a class="clip-btn-dl" href="${escapeAttr(clip.download_url)}" download="${escapeAttr(clip.title + (clip.file_ext || '.mp4'))}">Download</a>
+          <button type="button" class="clip-btn-del" onclick="deleteClip('${clip.id}', this)">Delete</button>
+        </div>
+      </div>
+    `;
+
+    grid.appendChild(card);
+  });
+}
+
+async function deleteClip(id, btnEl) {
+  if (!confirm('Delete this clip permanently?')) return;
+  btnEl.textContent = '...';
+  btnEl.disabled = true;
+
+  try {
+    const resp = await fetch('/api/library/' + id, { method: 'DELETE' });
+    if (resp.ok) {
+      const card = btnEl.closest('.clip-card');
+      card.style.opacity = '0';
+      card.style.transform = 'scale(0.9)';
+      setTimeout(() => { card.remove(); loadLibrary(); }, 300);
+    }
+  } catch (e) {
+    btnEl.textContent = 'Error';
+  }
+}
+
+function formatFileSize(bytes) {
+  if (bytes < 1024) return bytes + ' B';
+  if (bytes < 1048576) return (bytes / 1024).toFixed(1) + ' KB';
+  return (bytes / 1048576).toFixed(1) + ' MB';
+}
+
+function escapeHtml(str) {
+  const div = document.createElement('div');
+  div.textContent = str;
+  return div.innerHTML;
+}
+
+function escapeAttr(str) {
+  return str.replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/'/g,'&#39;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+// Load library on page load
+loadLibrary();
 </script>
 </body>
 </html>
