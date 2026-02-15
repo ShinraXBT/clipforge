@@ -10,6 +10,7 @@ import uuid
 import time
 import shutil
 from pathlib import Path
+from urllib.parse import urlparse
 from flask import Flask, request, jsonify, send_file
 
 import yt_dlp
@@ -18,6 +19,37 @@ app = Flask(__name__)
 
 TEMP_DIR = Path("/tmp/clipforge")
 TEMP_DIR.mkdir(exist_ok=True)
+
+# ── Security: rate limit tracking (per-IP, in-memory) ────────────────────────
+_rate_limit = {}  # ip -> (count, window_start)
+RATE_LIMIT_MAX = 15       # max requests per window
+RATE_LIMIT_WINDOW = 60    # window in seconds
+MAX_URL_LENGTH = 2048
+MAX_FILE_SIZE = 100 * 1024 * 1024  # 100 MB
+
+# Allowed hostname patterns per platform (SSRF protection)
+ALLOWED_HOSTS = {
+    "youtube":   re.compile(r'^(www\.)?(youtube\.com|youtu\.be|m\.youtube\.com)$', re.I),
+    "twitter":   re.compile(r'^(www\.)?(twitter\.com|x\.com|mobile\.twitter\.com|mobile\.x\.com)$', re.I),
+    "instagram": re.compile(r'^(www\.)?(instagram\.com|m\.instagram\.com)$', re.I),
+    "tiktok":    re.compile(r'^(www\.)?(tiktok\.com|vm\.tiktok\.com|m\.tiktok\.com)$', re.I),
+}
+
+
+def check_rate_limit(ip):
+    """Returns True if rate limited."""
+    now = time.time()
+    if ip in _rate_limit:
+        count, window_start = _rate_limit[ip]
+        if now - window_start > RATE_LIMIT_WINDOW:
+            _rate_limit[ip] = (1, now)
+            return False
+        if count >= RATE_LIMIT_MAX:
+            return True
+        _rate_limit[ip] = (count + 1, window_start)
+    else:
+        _rate_limit[ip] = (1, now)
+    return False
 
 
 def cleanup_old_files(max_age_seconds=300):
@@ -32,6 +64,36 @@ def cleanup_old_files(max_age_seconds=300):
                         item.unlink(missing_ok=True)
             except Exception:
                 pass
+
+
+def validate_url(url):
+    """Validate URL against SSRF and injection attacks. Returns (platform, error)."""
+    if not url or not isinstance(url, str):
+        return None, "No URL provided."
+
+    if len(url) > MAX_URL_LENGTH:
+        return None, "URL is too long."
+
+    # Block non-http(s) schemes (file://, ftp://, data://, etc.)
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        return None, "Only HTTP/HTTPS URLs are allowed."
+
+    # Must have a valid host
+    host = parsed.hostname
+    if not host:
+        return None, "Invalid URL."
+
+    # Detect platform
+    platform = detect_platform(url)
+    if not platform:
+        return None, "Unsupported URL. Paste a YouTube, Twitter/X, Instagram, or TikTok link."
+
+    # Verify hostname matches the detected platform (SSRF protection)
+    if not ALLOWED_HOSTS[platform].match(host):
+        return None, f"Invalid hostname for {platform}."
+
+    return platform, None
 
 
 def detect_platform(url):
@@ -59,13 +121,37 @@ def extract_video_id(url):
 
 
 def time_to_seconds(time_str):
+    """Safely parse MM:SS or HH:MM:SS, clamped to sane limits."""
+    if not isinstance(time_str, str) or not re.match(r'^\d{1,2}(:\d{1,2}){1,2}$', time_str.strip()):
+        return 0
     parts = time_str.strip().split(":")
     parts = [int(p) for p in parts]
     if len(parts) == 2:
-        return parts[0] * 60 + parts[1]
+        secs = parts[0] * 60 + parts[1]
     elif len(parts) == 3:
-        return parts[0] * 3600 + parts[1] * 60 + parts[2]
-    return 0
+        secs = parts[0] * 3600 + parts[1] * 60 + parts[2]
+    else:
+        return 0
+    return max(0, min(secs, 36000))  # clamp to 10 hours max
+
+
+def safe_ydl_opts(extra_opts=None):
+    """Base yt-dlp options with security hardening."""
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "socket_timeout": 30,
+        "nocheckcertificate": False,
+        # Disable dangerous features
+        "no_exec": True,
+        "no_color": True,
+        "geo_bypass": False,
+        "max_filesize": MAX_FILE_SIZE,
+    }
+    if extra_opts:
+        opts.update(extra_opts)
+    return opts
 
 
 def find_downloaded_file(directory, prefix):
@@ -74,6 +160,14 @@ def find_downloaded_file(directory, prefix):
         if f.name.startswith(prefix) and f.is_file():
             return f
     return None
+
+
+def cleanup_job_dir(job_dir):
+    """Remove a job directory after serving the file."""
+    try:
+        shutil.rmtree(job_dir, ignore_errors=True)
+    except Exception:
+        pass
 
 
 # ── Serve frontend ───────────────────────────────────────────────────────────
@@ -87,22 +181,27 @@ def index():
 
 @app.route("/api/video-info", methods=["POST"])
 def video_info():
-    data = request.json
+    # Rate limit
+    client_ip = request.headers.get("X-Forwarded-For", request.remote_addr or "unknown").split(",")[0].strip()
+    if check_rate_limit(client_ip):
+        return jsonify({"error": "Too many requests. Please wait a moment."}), 429
+
+    # Parse body
+    data = request.get_json(silent=True)
+    if not data:
+        return jsonify({"error": "Invalid request body."}), 400
+
     url = data.get("url", "")
 
-    platform = detect_platform(url)
-    if not platform:
-        return jsonify({"error": "Unsupported URL. Paste a YouTube, Twitter/X, Instagram, or TikTok link."}), 400
+    # Validate URL (SSRF + scheme + host checks)
+    platform, err = validate_url(url)
+    if err:
+        return jsonify({"error": err}), 400
 
     try:
-        ydl_opts = {
-            "quiet": True,
-            "no_warnings": True,
-            "noplaylist": True,
-            "skip_download": True,
-        }
+        opts = safe_ydl_opts({"skip_download": True})
 
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=False)
 
         if not info:
@@ -135,11 +234,19 @@ def video_info():
 def download_full():
     cleanup_old_files()
 
-    data = request.json
+    # Rate limit
+    client_ip = request.headers.get("X-Forwarded-For", request.remote_addr or "unknown").split(",")[0].strip()
+    if check_rate_limit(client_ip):
+        return jsonify({"error": "Too many requests. Please wait a moment."}), 429
+
+    data = request.get_json(silent=True)
+    if not data:
+        return jsonify({"error": "Invalid request body."}), 400
+
     url = data.get("url", "")
-    platform = detect_platform(url)
-    if not platform:
-        return jsonify({"error": "Unsupported URL"}), 400
+    platform, err = validate_url(url)
+    if err:
+        return jsonify({"error": err}), 400
 
     job_id = str(uuid.uuid4())[:12]
     job_dir = TEMP_DIR / job_id
@@ -148,21 +255,22 @@ def download_full():
     try:
         output_template = str(job_dir / "video.%(ext)s")
 
-        ydl_opts = {
+        opts = safe_ydl_opts({
             "format": "best[ext=mp4]/best",
             "outtmpl": output_template,
-            "noplaylist": True,
-            "quiet": True,
-            "no_warnings": True,
-            "socket_timeout": 30,
-        }
+        })
 
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        with yt_dlp.YoutubeDL(opts) as ydl:
             ydl.download([url])
 
         dl_file = find_downloaded_file(job_dir, "video")
         if not dl_file:
             return jsonify({"error": "Downloaded file not found."}), 500
+
+        # Check file size
+        if dl_file.stat().st_size > MAX_FILE_SIZE:
+            cleanup_job_dir(job_dir)
+            return jsonify({"error": "File too large (>100MB)."}), 413
 
         ext = dl_file.suffix or ".mp4"
         return send_file(
@@ -173,8 +281,10 @@ def download_full():
         )
 
     except yt_dlp.utils.DownloadError as e:
+        cleanup_job_dir(job_dir)
         return jsonify({"error": f"Download failed: {str(e)[:300]}"}), 500
     except Exception as e:
+        cleanup_job_dir(job_dir)
         return jsonify({"error": str(e)[:300]}), 500
 
 
@@ -184,14 +294,22 @@ def download_full():
 def trim_video():
     cleanup_old_files()
 
-    data = request.json
+    # Rate limit
+    client_ip = request.headers.get("X-Forwarded-For", request.remote_addr or "unknown").split(",")[0].strip()
+    if check_rate_limit(client_ip):
+        return jsonify({"error": "Too many requests. Please wait a moment."}), 429
+
+    data = request.get_json(silent=True)
+    if not data:
+        return jsonify({"error": "Invalid request body."}), 400
+
     url = data.get("url", "")
     start_time = data.get("start", "0:00")
     end_time = data.get("end", "0:00")
 
-    platform = detect_platform(url)
-    if not platform:
-        return jsonify({"error": "Unsupported URL"}), 400
+    platform, err = validate_url(url)
+    if err:
+        return jsonify({"error": err}), 400
 
     start_sec = time_to_seconds(start_time)
     end_sec = time_to_seconds(end_time)
@@ -210,25 +328,25 @@ def trim_video():
     try:
         output_template = str(job_dir / "clip.%(ext)s")
 
-        ydl_opts = {
+        opts = safe_ydl_opts({
             "format": "best[ext=mp4][height<=720]/best[height<=720]/best",
             "outtmpl": output_template,
-            "noplaylist": True,
-            "quiet": True,
-            "no_warnings": True,
-            "socket_timeout": 30,
             "download_ranges": yt_dlp.utils.download_range_func(
                 None, [(start_sec, end_sec)]
             ),
             "force_keyframes_at_cuts": True,
-        }
+        })
 
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        with yt_dlp.YoutubeDL(opts) as ydl:
             ydl.download([url])
 
         clip_file = find_downloaded_file(job_dir, "clip")
         if not clip_file:
             return jsonify({"error": "Downloaded file not found."}), 500
+
+        if clip_file.stat().st_size > MAX_FILE_SIZE:
+            cleanup_job_dir(job_dir)
+            return jsonify({"error": "File too large (>100MB)."}), 413
 
         ext = clip_file.suffix or ".mp4"
         return send_file(
@@ -239,8 +357,10 @@ def trim_video():
         )
 
     except yt_dlp.utils.DownloadError as e:
+        cleanup_job_dir(job_dir)
         return jsonify({"error": f"Trim failed: {str(e)[:300]}"}), 500
     except Exception as e:
+        cleanup_job_dir(job_dir)
         return jsonify({"error": str(e)[:300]}), 500
 
 
