@@ -20,9 +20,9 @@ from supabase import create_client
 app = Flask(__name__)
 
 # ── Supabase ─────────────────────────────────────────────────────────────────
-SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://yopxattfhvxackbnrblw.supabase.co")
-SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InlvcHhhdHRmaHZ4YWNrYm5yYmx3Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzExNTMwMjMsImV4cCI6MjA4NjcyOTAyM30.JMroS3lPPk5uLhA_N3qzpVMoQSHNhuYfDYqRnCy925Y")
-SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InlvcHhhdHRmaHZ4YWNrYm5yYmx3Iiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3MTE1MzAyMywiZXhwIjoyMDg2NzI5MDIzfQ.M7kKleJL-zz9nmt6pXZjZg_LKBRLakoeydXbx498IOc")
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
+SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
 sb = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
 TEMP_DIR = Path("/tmp/clipforge")
