@@ -1,6 +1,6 @@
 """
-ClipForge — YouTube Video Trimmer (Vercel Serverless)
-All routes served from a single Flask app.
+ClipForge — Multi-Platform Video Downloader & Trimmer (Vercel Serverless)
+Supports: YouTube, Twitter/X, Instagram, TikTok
 """
 
 import os
@@ -20,7 +20,6 @@ TEMP_DIR.mkdir(exist_ok=True)
 
 
 def cleanup_old_files(max_age_seconds=300):
-    """Remove temp files older than 5 minutes."""
     now = time.time()
     if TEMP_DIR.exists():
         for item in TEMP_DIR.iterdir():
@@ -34,7 +33,22 @@ def cleanup_old_files(max_age_seconds=300):
                 pass
 
 
+def detect_platform(url):
+    """Detect which platform a URL belongs to."""
+    url_lower = url.lower()
+    if re.search(r'(youtube\.com|youtu\.be)', url_lower):
+        return "youtube"
+    if re.search(r'(twitter\.com|x\.com)', url_lower):
+        return "twitter"
+    if re.search(r'instagram\.com', url_lower):
+        return "instagram"
+    if re.search(r'(tiktok\.com|vm\.tiktok)', url_lower):
+        return "tiktok"
+    return None
+
+
 def extract_video_id(url):
+    """Extract YouTube video ID for embed player."""
     patterns = [
         r'(?:youtube\.com/watch\?v=|youtu\.be/|youtube\.com/embed/|youtube\.com/shorts/)([a-zA-Z0-9_-]{11})',
     ]
@@ -62,35 +76,96 @@ def index():
     return INDEX_HTML
 
 
-# ── API: Video Info ──────────────────────────────────────────────────────────
+# ── API: Video Info (all platforms) ──────────────────────────────────────────
 
 @app.route("/api/video-info", methods=["POST"])
 def video_info():
     data = request.json
     url = data.get("url", "")
-    video_id = extract_video_id(url)
-    if not video_id:
-        return jsonify({"error": "Invalid YouTube URL"}), 400
+
+    platform = detect_platform(url)
+    if not platform:
+        return jsonify({"error": "Unsupported URL. Paste a YouTube, Twitter/X, Instagram, or TikTok link."}), 400
 
     try:
         cmd = ["yt-dlp", "--dump-json", "--no-playlist", url]
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=25)
         if result.returncode != 0:
-            return jsonify({"error": "Could not fetch video info"}), 400
+            return jsonify({"error": f"Could not fetch video info from {platform.title()}. Make sure the URL is valid and the video is public."}), 400
 
         info = json.loads(result.stdout)
+
+        # For YouTube, extract embed ID
+        yt_id = extract_video_id(url) if platform == "youtube" else None
+
         return jsonify({
-            "id": video_id,
-            "title": info.get("title", "Unknown"),
-            "duration": info.get("duration", 0),
+            "id": yt_id or info.get("id", "unknown"),
+            "platform": platform,
+            "title": info.get("title", info.get("description", "Untitled")[:80] or "Untitled"),
+            "duration": info.get("duration") or 0,
             "thumbnail": info.get("thumbnail", ""),
-            "channel": info.get("uploader", "Unknown"),
+            "channel": info.get("uploader", info.get("uploader_id", "Unknown")),
         })
+    except subprocess.TimeoutExpired:
+        return jsonify({"error": "Request timed out. The video may be unavailable."}), 504
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 
-# ── API: Trim (synchronous — downloads, trims, returns file) ─────────────────
+# ── API: Download (full video, no trim) ──────────────────────────────────────
+
+@app.route("/api/download-full", methods=["POST"])
+def download_full():
+    cleanup_old_files()
+
+    data = request.json
+    url = data.get("url", "")
+    platform = detect_platform(url)
+    if not platform:
+        return jsonify({"error": "Unsupported URL"}), 400
+
+    job_id = str(uuid.uuid4())[:12]
+    job_dir = TEMP_DIR / job_id
+    job_dir.mkdir(exist_ok=True)
+
+    try:
+        raw_output = job_dir / "video.%(ext)s"
+        dl_cmd = [
+            "yt-dlp",
+            "-f", "best[ext=mp4]/best",
+            "-o", str(raw_output),
+            "--no-playlist",
+            url,
+        ]
+        result = subprocess.run(dl_cmd, capture_output=True, text=True, timeout=55)
+        if result.returncode != 0:
+            return jsonify({"error": f"Download failed: {result.stderr[:300]}"}), 500
+
+        # Find downloaded file
+        dl_file = None
+        for f in job_dir.iterdir():
+            if f.name.startswith("video"):
+                dl_file = f
+                break
+
+        if not dl_file:
+            return jsonify({"error": "Downloaded file not found."}), 500
+
+        ext = dl_file.suffix or ".mp4"
+        return send_file(
+            str(dl_file),
+            as_attachment=True,
+            download_name=f"{platform}_{job_id}{ext}",
+            mimetype="video/mp4",
+        )
+
+    except subprocess.TimeoutExpired:
+        return jsonify({"error": "Download timed out. The video may be too large."}), 504
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# ── API: Trim (YouTube primarily, but works for any platform with duration) ──
 
 @app.route("/api/trim", methods=["POST"])
 def trim_video():
@@ -101,9 +176,9 @@ def trim_video():
     start_time = data.get("start", "0:00")
     end_time = data.get("end", "0:00")
 
-    video_id = extract_video_id(url)
-    if not video_id:
-        return jsonify({"error": "Invalid YouTube URL"}), 400
+    platform = detect_platform(url)
+    if not platform:
+        return jsonify({"error": "Unsupported URL"}), 400
 
     start_sec = time_to_seconds(start_time)
     end_sec = time_to_seconds(end_time)
@@ -120,7 +195,6 @@ def trim_video():
     job_dir.mkdir(exist_ok=True)
 
     try:
-        # Download the trimmed section directly with yt-dlp
         raw_output = job_dir / "clip.%(ext)s"
         dl_cmd = [
             "yt-dlp",
@@ -135,7 +209,6 @@ def trim_video():
         if result.returncode != 0:
             return jsonify({"error": f"Download failed: {result.stderr[:300]}"}), 500
 
-        # Find downloaded file
         clip_file = None
         for f in job_dir.iterdir():
             if f.name.startswith("clip"):
@@ -145,10 +218,11 @@ def trim_video():
         if not clip_file:
             return jsonify({"error": "Downloaded file not found."}), 500
 
+        ext = clip_file.suffix or ".mp4"
         return send_file(
             str(clip_file),
             as_attachment=True,
-            download_name=f"clip_{job_id}.mp4",
+            download_name=f"clip_{job_id}{ext}",
             mimetype="video/mp4",
         )
 
@@ -165,7 +239,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>ClipForge — YouTube Trimmer</title>
+<title>ClipForge — Video Downloader & Trimmer</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Outfit:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
 <style>
@@ -188,6 +262,10 @@ INDEX_HTML = r"""<!DOCTYPE html>
   --danger: #ff4060;
   --timeline-bg: #161a24;
   --timeline-region: #00e5a018;
+  --yt: #ff0033;
+  --tw: #1d9bf0;
+  --ig: #e1306c;
+  --tk: #00f2ea;
 }
 
 html { font-size: 16px; }
@@ -229,9 +307,10 @@ body::after {
   padding: 2rem 1.5rem 4rem;
 }
 
+/* ── Header ─────────────────────────────────────── */
 .header {
   text-align: center;
-  margin-bottom: 3rem;
+  margin-bottom: 2.5rem;
   animation: fadeSlideIn 0.8s ease-out;
 }
 
@@ -259,7 +338,7 @@ body::after {
 }
 
 .header h1 {
-  font-size: 2.6rem;
+  font-size: 2.4rem;
   font-weight: 800;
   letter-spacing: -1.5px;
   line-height: 1.1;
@@ -275,6 +354,44 @@ body::after {
   font-weight: 300;
 }
 
+/* ── Platform pills ─────────────────────────────── */
+.platforms {
+  display: flex;
+  justify-content: center;
+  gap: 0.5rem;
+  margin-top: 1rem;
+  flex-wrap: wrap;
+}
+
+.platform-pill {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.35rem 0.75rem;
+  border-radius: 20px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.65rem;
+  font-weight: 600;
+  letter-spacing: 0.5px;
+  border: 1px solid var(--border);
+  background: var(--bg-surface);
+  color: var(--text-secondary);
+  transition: all 0.3s;
+}
+
+.platform-pill svg { width: 14px; height: 14px; }
+.platform-pill.yt svg { color: var(--yt); }
+.platform-pill.tw svg { color: var(--tw); }
+.platform-pill.ig svg { color: var(--ig); }
+.platform-pill.tk svg { color: var(--tk); }
+
+.platform-pill.active {
+  border-color: var(--accent);
+  background: var(--accent-dim);
+  color: var(--text-primary);
+}
+
+/* ── Panels ─────────────────────────────────────── */
 .panel {
   background: var(--bg-panel);
   border: 1px solid var(--border);
@@ -305,6 +422,28 @@ body::after {
   box-shadow: 0 0 8px var(--accent-glow);
 }
 
+/* ── Platform badge (shown on detected platform) ── */
+.platform-badge {
+  display: none;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 1rem;
+  padding: 0.5rem 0.85rem;
+  border-radius: 8px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.7rem;
+  font-weight: 600;
+  letter-spacing: 1px;
+  animation: fadeSlideIn 0.4s ease-out;
+}
+.platform-badge.visible { display: inline-flex; }
+.platform-badge svg { width: 16px; height: 16px; }
+.platform-badge.youtube   { background: #ff003315; color: var(--yt); border: 1px solid #ff003330; }
+.platform-badge.twitter   { background: #1d9bf015; color: var(--tw); border: 1px solid #1d9bf030; }
+.platform-badge.instagram { background: #e1306c15; color: var(--ig); border: 1px solid #e1306c30; }
+.platform-badge.tiktok    { background: #00f2ea15; color: var(--tk); border: 1px solid #00f2ea30; }
+
+/* ── URL Input ──────────────────────────────────── */
 .url-group {
   display: flex;
   gap: 0.75rem;
@@ -354,6 +493,7 @@ body::after {
   box-shadow: none;
 }
 
+/* ── Video Preview ──────────────────────────────── */
 .preview-section { display: none; }
 .preview-section.visible { display: block; animation: fadeSlideIn 0.5s ease-out; }
 
@@ -378,6 +518,7 @@ body::after {
   font-weight: 600;
   line-height: 1.4;
   margin-bottom: 0.25rem;
+  word-break: break-word;
 }
 
 .video-info .channel {
@@ -414,6 +555,51 @@ body::after {
   border: none;
 }
 
+.player-wrap .no-embed {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  height: 100%;
+  color: var(--text-muted);
+  font-size: 0.85rem;
+  text-align: center;
+  padding: 2rem;
+  background: var(--bg-surface);
+}
+
+/* ── Mode Toggle (Trim vs Download) ─────────────── */
+.mode-toggle {
+  display: none;
+  gap: 0.5rem;
+  margin-bottom: 1.25rem;
+}
+.mode-toggle.visible { display: flex; }
+
+.mode-btn {
+  flex: 1;
+  padding: 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg-surface);
+  color: var(--text-secondary);
+  font-family: 'Outfit', sans-serif;
+  font-size: 0.85rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.25s;
+  text-align: center;
+}
+
+.mode-btn:hover { border-color: var(--border-light); color: var(--text-primary); }
+
+.mode-btn.active {
+  border-color: var(--accent);
+  background: var(--accent-dim);
+  color: var(--accent);
+}
+
+/* ── Timeline ───────────────────────────────────── */
 .timeline-section { display: none; }
 .timeline-section.visible { display: block; animation: fadeSlideIn 0.5s ease-out; }
 
@@ -541,10 +727,11 @@ body::after {
 }
 .clip-duration span { color: var(--accent); font-weight: 700; }
 
+/* ── Action Buttons ─────────────────────────────── */
 .action-section { display: none; }
 .action-section.visible { display: block; animation: fadeSlideIn 0.5s ease-out; }
 
-.btn-trim {
+.btn-action {
   width: 100%;
   padding: 1.1rem;
   background: linear-gradient(135deg, var(--accent) 0%, #00c98a 100%);
@@ -560,7 +747,7 @@ body::after {
   position: relative;
   overflow: hidden;
 }
-.btn-trim::before {
+.btn-action::before {
   content: '';
   position: absolute;
   inset: 0;
@@ -568,19 +755,20 @@ body::after {
   opacity: 0;
   transition: opacity 0.3s;
 }
-.btn-trim:hover::before { opacity: 1; }
-.btn-trim:hover {
+.btn-action:hover::before { opacity: 1; }
+.btn-action:hover {
   transform: translateY(-2px);
   box-shadow: 0 8px 32px var(--accent-glow);
 }
-.btn-trim:active { transform: translateY(0); }
-.btn-trim:disabled {
+.btn-action:active { transform: translateY(0); }
+.btn-action:disabled {
   opacity: 0.5;
   cursor: not-allowed;
   transform: none;
   box-shadow: none;
 }
 
+/* ── Progress ───────────────────────────────────── */
 .progress-section { display: none; }
 .progress-section.visible { display: block; animation: fadeSlideIn 0.5s ease-out; }
 
@@ -625,6 +813,7 @@ body::after {
   margin-right: 0.5rem;
 }
 
+/* ── Download Ready ─────────────────────────────── */
 .download-section { display: none; text-align: center; }
 .download-section.visible { display: block; animation: scalePop 0.5s cubic-bezier(0.175, 0.885, 0.32, 1.275); }
 
@@ -680,6 +869,7 @@ body::after {
 }
 .reset-link:hover { color: var(--text-secondary); }
 
+/* ── Error ──────────────────────────────────────── */
 .error-msg {
   display: none;
   background: #ff406010;
@@ -701,6 +891,7 @@ body::after {
   margin-top: 0.75rem;
 }
 
+/* ── Animations ─────────────────────────────────── */
 @keyframes fadeSlideIn {
   from { opacity: 0; transform: translateY(12px); }
   to { opacity: 1; transform: translateY(0); }
@@ -713,6 +904,7 @@ body::after {
 
 @keyframes spin { to { transform: rotate(360deg); } }
 
+/* ── Responsive ─────────────────────────────────── */
 @media (max-width: 600px) {
   .app-container { padding: 1.25rem 1rem 3rem; }
   .header h1 { font-size: 1.8rem; }
@@ -726,25 +918,49 @@ body::after {
 
 <div class="app-container">
 
+  <!-- Header -->
   <header class="header">
     <div class="logo">ClipForge</div>
-    <h1>Trim Any YouTube Video</h1>
-    <p>Paste a link, set your cut points, download the clip.</p>
+    <h1>Download & Trim Videos</h1>
+    <p>Paste a link from any supported platform, trim it or download it directly.</p>
+    <div class="platforms">
+      <div class="platform-pill yt" id="pillYt">
+        <svg viewBox="0 0 24 24" fill="currentColor"><path d="M23.5 6.2a3 3 0 0 0-2.1-2.1C19.5 3.5 12 3.5 12 3.5s-7.5 0-9.4.6A3 3 0 0 0 .5 6.2 31.4 31.4 0 0 0 0 12a31.4 31.4 0 0 0 .5 5.8 3 3 0 0 0 2.1 2.1c1.9.5 9.4.5 9.4.5s7.5 0 9.4-.6a3 3 0 0 0 2.1-2.1A31.4 31.4 0 0 0 24 12a31.4 31.4 0 0 0-.5-5.8zM9.6 15.5V8.5l6.3 3.5-6.3 3.5z"/></svg>
+        YouTube
+      </div>
+      <div class="platform-pill tw" id="pillTw">
+        <svg viewBox="0 0 24 24" fill="currentColor"><path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24H16.17l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25H8.08l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/></svg>
+        Twitter / X
+      </div>
+      <div class="platform-pill ig" id="pillIg">
+        <svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 2.16c3.2 0 3.58.01 4.85.07 3.25.15 4.77 1.69 4.92 4.92.06 1.27.07 1.65.07 4.85s-.01 3.58-.07 4.85c-.15 3.23-1.66 4.77-4.92 4.92-1.27.06-1.65.07-4.85.07s-3.58-.01-4.85-.07c-3.26-.15-4.77-1.7-4.92-4.92-.06-1.27-.07-1.65-.07-4.85s.01-3.58.07-4.85C2.38 3.86 3.9 2.31 7.15 2.23 8.42 2.17 8.8 2.16 12 2.16zM12 0C8.74 0 8.33.01 7.05.07 2.7.27.27 2.7.07 7.05.01 8.33 0 8.74 0 12s.01 3.67.07 4.95c.2 4.36 2.62 6.78 6.98 6.98C8.33 23.99 8.74 24 12 24s3.67-.01 4.95-.07c4.35-.2 6.78-2.62 6.98-6.98.06-1.28.07-1.69.07-4.95s-.01-3.67-.07-4.95c-.2-4.35-2.63-6.78-6.98-6.98C15.67.01 15.26 0 12 0zm0 5.84A6.16 6.16 0 1 0 18.16 12 6.16 6.16 0 0 0 12 5.84zM12 16a4 4 0 1 1 4-4 4 4 0 0 1-4 4zm6.4-11.85a1.44 1.44 0 1 0 1.44 1.44 1.44 1.44 0 0 0-1.44-1.44z"/></svg>
+        Instagram
+      </div>
+      <div class="platform-pill tk" id="pillTk">
+        <svg viewBox="0 0 24 24" fill="currentColor"><path d="M19.59 6.69a4.83 4.83 0 0 1-3.77-4.25V2h-3.45v13.67a2.89 2.89 0 0 1-2.88 2.5 2.89 2.89 0 0 1-2.89-2.89 2.89 2.89 0 0 1 2.89-2.89c.28 0 .54.04.79.1v-3.5a6.37 6.37 0 0 0-.79-.05A6.34 6.34 0 0 0 3.15 15a6.34 6.34 0 0 0 6.34 6.34 6.34 6.34 0 0 0 6.34-6.34V8.1a8.16 8.16 0 0 0 4.76 1.52v-3.4a4.85 4.85 0 0 1-1-.07z"/></svg>
+        TikTok
+      </div>
+    </div>
   </header>
 
+  <!-- URL Input -->
   <div class="panel">
     <div class="panel-label"><span class="dot"></span> Source</div>
     <div class="url-group">
       <input type="text" class="url-input" id="urlInput"
-             placeholder="https://youtube.com/watch?v=..."
+             placeholder="Paste a YouTube, Twitter, Instagram, or TikTok URL..."
              spellcheck="false" autocomplete="off">
       <button class="btn-load" id="btnLoad" onclick="loadVideo()">Load</button>
     </div>
     <div class="error-msg" id="urlError"></div>
   </div>
 
+  <!-- Video Preview -->
   <div class="panel preview-section" id="previewSection">
     <div class="panel-label"><span class="dot"></span> Preview</div>
+
+    <div class="platform-badge" id="platformBadge"></div>
+
     <div class="video-meta">
       <img class="video-thumb" id="videoThumb" src="" alt="">
       <div class="video-info">
@@ -753,11 +969,18 @@ body::after {
         <div class="duration-badge" id="videoDuration"></div>
       </div>
     </div>
-    <div class="player-wrap">
+    <div class="player-wrap" id="playerWrap">
       <iframe id="ytPlayer" src="" allow="autoplay; encrypted-media" allowfullscreen></iframe>
     </div>
   </div>
 
+  <!-- Mode Toggle -->
+  <div class="mode-toggle" id="modeToggle">
+    <button class="mode-btn active" id="modeDownload" onclick="setMode('download')">Download Full</button>
+    <button class="mode-btn" id="modeTrim" onclick="setMode('trim')">Trim & Download</button>
+  </div>
+
+  <!-- Timeline (trim mode) -->
   <div class="panel timeline-section" id="timelineSection">
     <div class="panel-label"><span class="dot"></span> Trim Range</div>
     <div class="time-controls">
@@ -783,24 +1006,27 @@ body::after {
     <div class="clip-duration">Clip length: <span id="clipDuration">0:00</span></div>
   </div>
 
+  <!-- Action Button -->
   <div class="action-section" id="actionSection">
-    <button class="btn-trim" id="btnTrim" onclick="startTrim()">
-      Trim & Download
+    <button class="btn-action" id="btnAction" onclick="startAction()">
+      Download Video
     </button>
-    <div class="limit-note">Max clip length: 10 minutes</div>
+    <div class="limit-note" id="limitNote"></div>
     <div class="error-msg" id="trimError"></div>
   </div>
 
+  <!-- Progress -->
   <div class="panel progress-section" id="progressSection">
     <div class="panel-label"><span class="dot"></span> Processing</div>
     <div class="progress-bar-track">
       <div class="progress-bar-fill" id="progressFill"></div>
     </div>
     <div class="progress-status" id="progressStatus">
-      <span class="spinner"></span> Downloading & trimming your clip...
+      <span class="spinner"></span> Downloading video...
     </div>
   </div>
 
+  <!-- Download -->
   <div class="panel download-section" id="downloadSection">
     <div class="download-icon">
       <svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -809,11 +1035,11 @@ body::after {
         <line x1="12" y1="15" x2="12" y2="3"/>
       </svg>
     </div>
-    <div class="success-text">Your clip is ready!</div>
+    <div class="success-text">Your video is ready!</div>
     <p style="color:var(--text-secondary);font-size:0.85rem;margin-bottom:0.5rem" id="downloadInfo"></p>
     <a class="btn-download" id="btnDownload" href="#">Download MP4</a>
     <br>
-    <button class="reset-link" onclick="resetAll()">Trim another video</button>
+    <button class="reset-link" onclick="resetAll()">Download another video</button>
   </div>
 
 </div>
@@ -821,15 +1047,57 @@ body::after {
 <script>
 let videoDuration = 0;
 let videoId = '';
+let currentPlatform = '';
+let currentMode = 'download';
 let dragging = null;
 
+const PLATFORM_LABELS = {
+  youtube:   'YouTube',
+  twitter:   'Twitter / X',
+  instagram: 'Instagram',
+  tiktok:    'TikTok',
+};
+
+const PLATFORM_ICONS = {
+  youtube:   '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M23.5 6.2a3 3 0 0 0-2.1-2.1C19.5 3.5 12 3.5 12 3.5s-7.5 0-9.4.6A3 3 0 0 0 .5 6.2 31.4 31.4 0 0 0 0 12a31.4 31.4 0 0 0 .5 5.8 3 3 0 0 0 2.1 2.1c1.9.5 9.4.5 9.4.5s7.5 0 9.4-.6a3 3 0 0 0 2.1-2.1A31.4 31.4 0 0 0 24 12a31.4 31.4 0 0 0-.5-5.8zM9.6 15.5V8.5l6.3 3.5-6.3 3.5z"/></svg>',
+  twitter:   '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24H16.17l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25H8.08l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/></svg>',
+  instagram: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 2.16c3.2 0 3.58.01 4.85.07 3.25.15 4.77 1.69 4.92 4.92.06 1.27.07 1.65.07 4.85s-.01 3.58-.07 4.85c-.15 3.23-1.66 4.77-4.92 4.92-1.27.06-1.65.07-4.85.07s-3.58-.01-4.85-.07c-3.26-.15-4.77-1.7-4.92-4.92-.06-1.27-.07-1.65-.07-4.85s.01-3.58.07-4.85C2.38 3.86 3.9 2.31 7.15 2.23 8.42 2.17 8.8 2.16 12 2.16zM12 0C8.74 0 8.33.01 7.05.07 2.7.27.27 2.7.07 7.05.01 8.33 0 8.74 0 12s.01 3.67.07 4.95c.2 4.36 2.62 6.78 6.98 6.98C8.33 23.99 8.74 24 12 24s3.67-.01 4.95-.07c4.35-.2 6.78-2.62 6.98-6.98.06-1.28.07-1.69.07-4.95s-.01-3.67-.07-4.95c-.2-4.35-2.63-6.78-6.98-6.98C15.67.01 15.26 0 12 0zm0 5.84A6.16 6.16 0 1 0 18.16 12 6.16 6.16 0 0 0 12 5.84zM12 16a4 4 0 1 1 4-4 4 4 0 0 1-4 4zm6.4-11.85a1.44 1.44 0 1 0 1.44 1.44 1.44 1.44 0 0 0-1.44-1.44z"/></svg>',
+  tiktok:    '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M19.59 6.69a4.83 4.83 0 0 1-3.77-4.25V2h-3.45v13.67a2.89 2.89 0 0 1-2.88 2.5 2.89 2.89 0 0 1-2.89-2.89 2.89 2.89 0 0 1 2.89-2.89c.28 0 .54.04.79.1v-3.5a6.37 6.37 0 0 0-.79-.05A6.34 6.34 0 0 0 3.15 15a6.34 6.34 0 0 0 6.34 6.34 6.34 6.34 0 0 0 6.34-6.34V8.1a8.16 8.16 0 0 0 4.76 1.52v-3.4a4.85 4.85 0 0 1-1-.07z"/></svg>',
+};
+
+// ── Detect platform from URL ────────────────
+function detectPlatform(url) {
+  url = url.toLowerCase();
+  if (/youtube\.com|youtu\.be/.test(url)) return 'youtube';
+  if (/twitter\.com|x\.com/.test(url)) return 'twitter';
+  if (/instagram\.com/.test(url)) return 'instagram';
+  if (/tiktok\.com|vm\.tiktok/.test(url)) return 'tiktok';
+  return null;
+}
+
+// ── Highlight platform pill on input ────────
+document.getElementById('urlInput').addEventListener('input', function() {
+  const p = detectPlatform(this.value);
+  document.querySelectorAll('.platform-pill').forEach(el => el.classList.remove('active'));
+  if (p === 'youtube') document.getElementById('pillYt').classList.add('active');
+  else if (p === 'twitter') document.getElementById('pillTw').classList.add('active');
+  else if (p === 'instagram') document.getElementById('pillIg').classList.add('active');
+  else if (p === 'tiktok') document.getElementById('pillTk').classList.add('active');
+});
+
+// ── Load Video ──────────────────────────────
 async function loadVideo() {
   const url = document.getElementById('urlInput').value.trim();
   const btn = document.getElementById('btnLoad');
-  const err = document.getElementById('urlError');
-  err.classList.remove('visible');
+  document.getElementById('urlError').classList.remove('visible');
 
-  if (!url) { showError('urlError', 'Please paste a YouTube URL.'); return; }
+  if (!url) { showError('urlError', 'Please paste a video URL.'); return; }
+
+  const platform = detectPlatform(url);
+  if (!platform) {
+    showError('urlError', 'Unsupported URL. Paste a YouTube, Twitter/X, Instagram, or TikTok link.');
+    return;
+  }
 
   btn.disabled = true;
   btn.textContent = 'Loading...';
@@ -844,23 +1112,58 @@ async function loadVideo() {
 
     if (!resp.ok) { showError('urlError', data.error || 'Failed to load video.'); return; }
 
+    currentPlatform = data.platform || platform;
     videoId = data.id;
-    videoDuration = data.duration;
+    videoDuration = data.duration || 0;
 
-    document.getElementById('videoThumb').src = data.thumbnail;
-    document.getElementById('videoTitle').textContent = data.title;
-    document.getElementById('videoChannel').textContent = data.channel;
-    document.getElementById('videoDuration').textContent = formatTime(data.duration);
-    document.getElementById('ytPlayer').src =
-      `https://www.youtube.com/embed/${data.id}?rel=0&modestbranding=1`;
+    // Platform badge
+    const badge = document.getElementById('platformBadge');
+    badge.className = `platform-badge visible ${currentPlatform}`;
+    badge.innerHTML = `${PLATFORM_ICONS[currentPlatform] || ''} ${PLATFORM_LABELS[currentPlatform] || currentPlatform}`;
 
-    document.getElementById('endInput').value = formatTime(data.duration);
-    document.getElementById('totalDurationLabel').textContent = formatTime(data.duration);
-    document.getElementById('clipDuration').textContent = formatTime(data.duration);
+    // Video meta
+    document.getElementById('videoThumb').src = data.thumbnail || '';
+    document.getElementById('videoTitle').textContent = data.title || 'Untitled';
+    document.getElementById('videoChannel').textContent = data.channel || '';
+    document.getElementById('videoDuration').textContent = videoDuration ? formatTime(videoDuration) : 'N/A';
 
+    // Player — only YouTube gets embed
+    const playerWrap = document.getElementById('playerWrap');
+    const ytPlayer = document.getElementById('ytPlayer');
+    if (currentPlatform === 'youtube' && videoId) {
+      ytPlayer.src = `https://www.youtube.com/embed/${videoId}?rel=0&modestbranding=1`;
+      ytPlayer.style.display = '';
+      const noEmbed = playerWrap.querySelector('.no-embed');
+      if (noEmbed) noEmbed.remove();
+    } else {
+      ytPlayer.style.display = 'none';
+      ytPlayer.src = '';
+      let noEmbed = playerWrap.querySelector('.no-embed');
+      if (!noEmbed) {
+        noEmbed = document.createElement('div');
+        noEmbed.className = 'no-embed';
+        playerWrap.appendChild(noEmbed);
+      }
+      noEmbed.textContent = `Preview not available for ${PLATFORM_LABELS[currentPlatform]}. Use the original link to preview.`;
+    }
+
+    // Timeline defaults
+    document.getElementById('startInput').value = '0:00';
+    document.getElementById('endInput').value = videoDuration ? formatTime(videoDuration) : '0:00';
+    document.getElementById('totalDurationLabel').textContent = videoDuration ? formatTime(videoDuration) : '0:00';
+    document.getElementById('clipDuration').textContent = videoDuration ? formatTime(videoDuration) : '0:00';
+
+    // Show sections
     document.getElementById('previewSection').classList.add('visible');
-    document.getElementById('timelineSection').classList.add('visible');
+    document.getElementById('modeToggle').classList.add('visible');
     document.getElementById('actionSection').classList.add('visible');
+
+    // Default mode: download for short videos / non-YT, trim for YT
+    if (currentPlatform === 'youtube' && videoDuration > 30) {
+      setMode('trim');
+    } else {
+      setMode('download');
+    }
 
     generateWaveform();
     updateTimeline();
@@ -872,6 +1175,34 @@ async function loadVideo() {
   }
 }
 
+// ── Mode toggle ─────────────────────────────
+function setMode(mode) {
+  currentMode = mode;
+  document.getElementById('modeDownload').classList.toggle('active', mode === 'download');
+  document.getElementById('modeTrim').classList.toggle('active', mode === 'trim');
+
+  const btn = document.getElementById('btnAction');
+  const note = document.getElementById('limitNote');
+
+  if (mode === 'trim') {
+    document.getElementById('timelineSection').classList.add('visible');
+    btn.textContent = 'Trim & Download';
+    note.textContent = 'Max clip length: 10 minutes';
+
+    // Hide trim option if no duration
+    if (!videoDuration) {
+      showError('trimError', 'Trim not available — video duration unknown.');
+      setMode('download');
+      return;
+    }
+  } else {
+    document.getElementById('timelineSection').classList.remove('visible');
+    btn.textContent = 'Download Video';
+    note.textContent = '';
+  }
+}
+
+// ── Timeline ────────────────────────────────
 function generateWaveform() {
   const container = document.getElementById('waveform');
   container.innerHTML = '';
@@ -925,67 +1256,96 @@ document.addEventListener('touchend', () => { dragging = null; });
 document.getElementById('startInput').addEventListener('input', updateTimeline);
 document.getElementById('endInput').addEventListener('input', updateTimeline);
 
-async function startTrim() {
+// ── Action (Download or Trim) ───────────────
+async function startAction() {
   const url = document.getElementById('urlInput').value.trim();
-  const start = document.getElementById('startInput').value.trim();
-  const end = document.getElementById('endInput').value.trim();
   const errEl = document.getElementById('trimError');
   errEl.classList.remove('visible');
 
-  if (parseTime(end) <= parseTime(start)) {
-    showError('trimError', 'End time must be after start time.');
-    return;
-  }
-
-  if (parseTime(end) - parseTime(start) > 600) {
-    showError('trimError', 'Clips are limited to 10 minutes max.');
-    return;
-  }
-
-  document.getElementById('btnTrim').disabled = true;
+  const btn = document.getElementById('btnAction');
+  btn.disabled = true;
   document.getElementById('progressSection').classList.add('visible');
   document.getElementById('actionSection').classList.remove('visible');
 
+  let endpoint, body, infoText;
+
+  if (currentMode === 'trim') {
+    const start = document.getElementById('startInput').value.trim();
+    const end = document.getElementById('endInput').value.trim();
+
+    if (parseTime(end) <= parseTime(start)) {
+      showError('trimError', 'End time must be after start time.');
+      restoreAction();
+      return;
+    }
+    if (parseTime(end) - parseTime(start) > 600) {
+      showError('trimError', 'Clips are limited to 10 minutes max.');
+      restoreAction();
+      return;
+    }
+
+    endpoint = '/api/trim';
+    body = { url, start, end };
+    infoText = `Trimmed from ${start} to ${end}`;
+    document.getElementById('progressStatus').innerHTML =
+      '<span class="spinner"></span> Downloading & trimming your clip...';
+  } else {
+    endpoint = '/api/download-full';
+    body = { url };
+    infoText = `Full video from ${PLATFORM_LABELS[currentPlatform] || 'source'}`;
+    document.getElementById('progressStatus').innerHTML =
+      '<span class="spinner"></span> Downloading video...';
+  }
+
   try {
-    const resp = await fetch('/api/trim', {
+    const resp = await fetch(endpoint, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ url, start, end }),
+      body: JSON.stringify(body),
     });
 
     if (!resp.ok) {
-      let errMsg = 'Trimming failed.';
+      let errMsg = 'Download failed.';
       try { const d = await resp.json(); errMsg = d.error || errMsg; } catch {}
       throw new Error(errMsg);
     }
 
-    // Response is the file itself — create a download
     const blob = await resp.blob();
     const downloadUrl = URL.createObjectURL(blob);
 
     document.getElementById('progressSection').classList.remove('visible');
-    document.getElementById('downloadInfo').textContent = `Trimmed from ${start} to ${end}`;
+    document.getElementById('downloadInfo').textContent = infoText;
     document.getElementById('btnDownload').href = downloadUrl;
-    document.getElementById('btnDownload').setAttribute('download', `clip_${videoId}.mp4`);
+    document.getElementById('btnDownload').setAttribute('download',
+      `${currentPlatform}_${videoId || 'video'}.mp4`);
     document.getElementById('downloadSection').classList.add('visible');
 
   } catch (e) {
-    document.getElementById('progressSection').classList.remove('visible');
     showError('trimError', e.message);
-    document.getElementById('actionSection').classList.add('visible');
-    document.getElementById('btnTrim').disabled = false;
+    restoreAction();
   }
+}
+
+function restoreAction() {
+  document.getElementById('progressSection').classList.remove('visible');
+  document.getElementById('actionSection').classList.add('visible');
+  document.getElementById('btnAction').disabled = false;
 }
 
 function resetAll() {
   ['previewSection','timelineSection','actionSection','progressSection','downloadSection'].forEach(id =>
     document.getElementById(id).classList.remove('visible'));
+  document.getElementById('modeToggle').classList.remove('visible');
   document.getElementById('urlInput').value = '';
-  document.getElementById('btnTrim').disabled = false;
+  document.getElementById('btnAction').disabled = false;
+  document.querySelectorAll('.platform-pill').forEach(el => el.classList.remove('active'));
   videoDuration = 0;
   videoId = '';
+  currentPlatform = '';
+  currentMode = 'download';
 }
 
+// ── Utilities ───────────────────────────────
 function formatTime(sec) {
   sec = Math.max(0, Math.round(sec));
   const m = Math.floor(sec / 60);
@@ -1015,6 +1375,6 @@ document.getElementById('urlInput').addEventListener('keydown', e => {
 """
 
 if __name__ == "__main__":
-    print("\n  ClipForge — YouTube Video Trimmer")
+    print("\n  ClipForge — Video Downloader & Trimmer")
     print("  Running at http://localhost:5000\n")
     app.run(debug=True, port=5000)
