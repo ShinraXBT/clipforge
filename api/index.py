@@ -13,13 +13,6 @@ import shutil
 from pathlib import Path
 from flask import Flask, request, jsonify, send_file, Response
 
-# Locate ffmpeg — use static-ffmpeg package (provides Linux binaries on Lambda)
-try:
-    import static_ffmpeg
-    static_ffmpeg.add_paths()
-except ImportError:
-    pass
-
 app = Flask(__name__)
 
 TEMP_DIR = Path("/tmp/clipforge")
@@ -127,15 +120,15 @@ def trim_video():
     job_dir.mkdir(exist_ok=True)
 
     try:
-        # Step 1: Download
-        raw_output = job_dir / "raw.%(ext)s"
+        # Download the trimmed section directly with yt-dlp
+        raw_output = job_dir / "clip.%(ext)s"
         dl_cmd = [
             "yt-dlp",
-            "-f", "bestvideo[ext=mp4][height<=720]+bestaudio[ext=m4a]/best[ext=mp4][height<=720]/best[height<=720]",
-            "--merge-output-format", "mp4",
+            "-f", "best[ext=mp4][height<=720]/best[height<=720]/best",
             "-o", str(raw_output),
             "--no-playlist",
             "--download-sections", f"*{start_sec}-{end_sec}",
+            "--force-keyframes-at-cuts",
             url,
         ]
         result = subprocess.run(dl_cmd, capture_output=True, text=True, timeout=55)
@@ -143,34 +136,17 @@ def trim_video():
             return jsonify({"error": f"Download failed: {result.stderr[:300]}"}), 500
 
         # Find downloaded file
-        raw_file = None
+        clip_file = None
         for f in job_dir.iterdir():
-            if f.name.startswith("raw"):
-                raw_file = f
+            if f.name.startswith("clip"):
+                clip_file = f
                 break
 
-        if not raw_file:
+        if not clip_file:
             return jsonify({"error": "Downloaded file not found."}), 500
 
-        # Step 2: Re-encode with ffmpeg for clean cuts
-        output_file = job_dir / "trimmed.mp4"
-        trim_cmd = [
-            "ffmpeg", "-y",
-            "-i", str(raw_file),
-            "-c:v", "libx264",
-            "-c:a", "aac",
-            "-movflags", "+faststart",
-            "-preset", "ultrafast",
-            str(output_file),
-        ]
-        result = subprocess.run(trim_cmd, capture_output=True, text=True, timeout=55)
-
-        # If re-encode fails, serve the raw download (already trimmed by yt-dlp)
-        if result.returncode != 0 or not output_file.exists():
-            output_file = raw_file
-
         return send_file(
-            str(output_file),
+            str(clip_file),
             as_attachment=True,
             download_name=f"clip_{job_id}.mp4",
             mimetype="video/mp4",
@@ -180,9 +156,6 @@ def trim_video():
         return jsonify({"error": "Processing timed out. Try a shorter clip."}), 504
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-    finally:
-        # Schedule cleanup (files stay briefly for the send_file to complete)
-        pass
 
 
 # ── Frontend HTML ────────────────────────────────────────────────────────────
