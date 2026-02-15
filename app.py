@@ -1,17 +1,18 @@
 """
 ClipForge — Multi-Platform Video Downloader & Trimmer (Vercel Serverless)
 Supports: YouTube, Twitter/X, Instagram, TikTok
+Uses yt-dlp as a Python library (not CLI) for Vercel compatibility.
 """
 
 import os
 import re
-import json
 import uuid
-import subprocess
 import time
 import shutil
 from pathlib import Path
-from flask import Flask, request, jsonify, send_file, Response
+from flask import Flask, request, jsonify, send_file
+
+import yt_dlp
 
 app = Flask(__name__)
 
@@ -34,7 +35,6 @@ def cleanup_old_files(max_age_seconds=300):
 
 
 def detect_platform(url):
-    """Detect which platform a URL belongs to."""
     url_lower = url.lower()
     if re.search(r'(youtube\.com|youtu\.be)', url_lower):
         return "youtube"
@@ -48,7 +48,6 @@ def detect_platform(url):
 
 
 def extract_video_id(url):
-    """Extract YouTube video ID for embed player."""
     patterns = [
         r'(?:youtube\.com/watch\?v=|youtu\.be/|youtube\.com/embed/|youtube\.com/shorts/)([a-zA-Z0-9_-]{11})',
     ]
@@ -67,6 +66,14 @@ def time_to_seconds(time_str):
     elif len(parts) == 3:
         return parts[0] * 3600 + parts[1] * 60 + parts[2]
     return 0
+
+
+def find_downloaded_file(directory, prefix):
+    """Find the first file in directory starting with prefix."""
+    for f in directory.iterdir():
+        if f.name.startswith(prefix) and f.is_file():
+            return f
+    return None
 
 
 # ── Serve frontend ───────────────────────────────────────────────────────────
@@ -88,28 +95,38 @@ def video_info():
         return jsonify({"error": "Unsupported URL. Paste a YouTube, Twitter/X, Instagram, or TikTok link."}), 400
 
     try:
-        cmd = ["yt-dlp", "--dump-json", "--no-playlist", url]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=25)
-        if result.returncode != 0:
-            return jsonify({"error": f"Could not fetch video info from {platform.title()}. Make sure the URL is valid and the video is public."}), 400
+        ydl_opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "noplaylist": True,
+            "skip_download": True,
+        }
 
-        info = json.loads(result.stdout)
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
 
-        # For YouTube, extract embed ID
+        if not info:
+            return jsonify({"error": f"Could not fetch video info from {platform.title()}."}), 400
+
         yt_id = extract_video_id(url) if platform == "youtube" else None
+
+        title = info.get("title") or ""
+        if not title:
+            desc = info.get("description") or "Untitled"
+            title = desc[:80]
 
         return jsonify({
             "id": yt_id or info.get("id", "unknown"),
             "platform": platform,
-            "title": info.get("title", info.get("description", "Untitled")[:80] or "Untitled"),
+            "title": title or "Untitled",
             "duration": info.get("duration") or 0,
             "thumbnail": info.get("thumbnail", ""),
-            "channel": info.get("uploader", info.get("uploader_id", "Unknown")),
+            "channel": info.get("uploader") or info.get("uploader_id") or "Unknown",
         })
-    except subprocess.TimeoutExpired:
-        return jsonify({"error": "Request timed out. The video may be unavailable."}), 504
+    except yt_dlp.utils.DownloadError as e:
+        return jsonify({"error": f"Could not fetch video: {str(e)[:200]}"}), 400
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"error": str(e)[:300]}), 500
 
 
 # ── API: Download (full video, no trim) ──────────────────────────────────────
@@ -129,25 +146,21 @@ def download_full():
     job_dir.mkdir(exist_ok=True)
 
     try:
-        raw_output = job_dir / "video.%(ext)s"
-        dl_cmd = [
-            "yt-dlp",
-            "-f", "best[ext=mp4]/best",
-            "-o", str(raw_output),
-            "--no-playlist",
-            url,
-        ]
-        result = subprocess.run(dl_cmd, capture_output=True, text=True, timeout=55)
-        if result.returncode != 0:
-            return jsonify({"error": f"Download failed: {result.stderr[:300]}"}), 500
+        output_template = str(job_dir / "video.%(ext)s")
 
-        # Find downloaded file
-        dl_file = None
-        for f in job_dir.iterdir():
-            if f.name.startswith("video"):
-                dl_file = f
-                break
+        ydl_opts = {
+            "format": "best[ext=mp4]/best",
+            "outtmpl": output_template,
+            "noplaylist": True,
+            "quiet": True,
+            "no_warnings": True,
+            "socket_timeout": 30,
+        }
 
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
+
+        dl_file = find_downloaded_file(job_dir, "video")
         if not dl_file:
             return jsonify({"error": "Downloaded file not found."}), 500
 
@@ -159,13 +172,13 @@ def download_full():
             mimetype="video/mp4",
         )
 
-    except subprocess.TimeoutExpired:
-        return jsonify({"error": "Download timed out. The video may be too large."}), 504
+    except yt_dlp.utils.DownloadError as e:
+        return jsonify({"error": f"Download failed: {str(e)[:300]}"}), 500
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"error": str(e)[:300]}), 500
 
 
-# ── API: Trim (YouTube primarily, but works for any platform with duration) ──
+# ── API: Trim (works for any platform with duration) ─────────────────────────
 
 @app.route("/api/trim", methods=["POST"])
 def trim_video():
@@ -195,26 +208,25 @@ def trim_video():
     job_dir.mkdir(exist_ok=True)
 
     try:
-        raw_output = job_dir / "clip.%(ext)s"
-        dl_cmd = [
-            "yt-dlp",
-            "-f", "best[ext=mp4][height<=720]/best[height<=720]/best",
-            "-o", str(raw_output),
-            "--no-playlist",
-            "--download-sections", f"*{start_sec}-{end_sec}",
-            "--force-keyframes-at-cuts",
-            url,
-        ]
-        result = subprocess.run(dl_cmd, capture_output=True, text=True, timeout=55)
-        if result.returncode != 0:
-            return jsonify({"error": f"Download failed: {result.stderr[:300]}"}), 500
+        output_template = str(job_dir / "clip.%(ext)s")
 
-        clip_file = None
-        for f in job_dir.iterdir():
-            if f.name.startswith("clip"):
-                clip_file = f
-                break
+        ydl_opts = {
+            "format": "best[ext=mp4][height<=720]/best[height<=720]/best",
+            "outtmpl": output_template,
+            "noplaylist": True,
+            "quiet": True,
+            "no_warnings": True,
+            "socket_timeout": 30,
+            "download_ranges": yt_dlp.utils.download_range_func(
+                None, [(start_sec, end_sec)]
+            ),
+            "force_keyframes_at_cuts": True,
+        }
 
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
+
+        clip_file = find_downloaded_file(job_dir, "clip")
         if not clip_file:
             return jsonify({"error": "Downloaded file not found."}), 500
 
@@ -226,10 +238,10 @@ def trim_video():
             mimetype="video/mp4",
         )
 
-    except subprocess.TimeoutExpired:
-        return jsonify({"error": "Processing timed out. Try a shorter clip."}), 504
+    except yt_dlp.utils.DownloadError as e:
+        return jsonify({"error": f"Trim failed: {str(e)[:300]}"}), 500
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"error": str(e)[:300]}), 500
 
 
 # ── Frontend HTML ────────────────────────────────────────────────────────────
