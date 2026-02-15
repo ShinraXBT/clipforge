@@ -14,8 +14,12 @@ from pathlib import Path
 from urllib.parse import urlparse
 from flask import Flask, request, jsonify, send_file
 
+import logging
+
 import yt_dlp
 from supabase import create_client
+
+logger = logging.getLogger("clipforge")
 
 app = Flask(__name__)
 
@@ -60,10 +64,12 @@ def set_security_headers(response):
 
 # Allowed hostname patterns per platform (SSRF protection)
 ALLOWED_HOSTS = {
-    "youtube":   re.compile(r'^(www\.)?(youtube\.com|youtu\.be|m\.youtube\.com)$', re.I),
-    "twitter":   re.compile(r'^(www\.)?(twitter\.com|x\.com|mobile\.twitter\.com|mobile\.x\.com)$', re.I),
-    "instagram": re.compile(r'^(www\.)?(instagram\.com|m\.instagram\.com)$', re.I),
-    "tiktok":    re.compile(r'^(www\.)?(tiktok\.com|vm\.tiktok\.com|m\.tiktok\.com)$', re.I),
+    "youtube":    re.compile(r'^(www\.)?(youtube\.com|youtu\.be|m\.youtube\.com)$', re.I),
+    "twitter":    re.compile(r'^(www\.)?(twitter\.com|x\.com|mobile\.twitter\.com|mobile\.x\.com)$', re.I),
+    "instagram":  re.compile(r'^(www\.)?(instagram\.com|m\.instagram\.com)$', re.I),
+    "tiktok":     re.compile(r'^(www\.)?(tiktok\.com|vm\.tiktok\.com|m\.tiktok\.com)$', re.I),
+    "twitch":     re.compile(r'^(www\.)?(twitch\.tv|clips\.twitch\.tv|m\.twitch\.tv)$', re.I),
+    "soundcloud": re.compile(r'^(www\.)?(soundcloud\.com|m\.soundcloud\.com)$', re.I),
 }
 
 
@@ -132,7 +138,7 @@ def validate_url(url):
     # Detect platform
     platform = detect_platform(url)
     if not platform:
-        return None, "Unsupported URL. Paste a YouTube, Twitter/X, Instagram, or TikTok link."
+        return None, "Unsupported URL. Paste a YouTube, Twitter/X, Instagram, TikTok, Twitch, or SoundCloud link."
 
     # Verify hostname matches the detected platform (SSRF protection)
     if not ALLOWED_HOSTS[platform].match(host):
@@ -151,6 +157,10 @@ def detect_platform(url):
         return "instagram"
     if re.search(r'(tiktok\.com|vm\.tiktok)', url_lower):
         return "tiktok"
+    if re.search(r'twitch\.tv', url_lower):
+        return "twitch"
+    if re.search(r'soundcloud\.com', url_lower):
+        return "soundcloud"
     return None
 
 
@@ -200,6 +210,29 @@ def safe_ydl_opts(extra_opts=None):
     if extra_opts:
         opts.update(extra_opts)
     return opts
+
+
+def build_format_string(quality="720p", fmt="mp4", is_trim=False):
+    """Build yt-dlp format string from quality/format preferences."""
+    RESOLUTION_MAP = {"360p": 360, "480p": 480, "720p": 720, "1080p": 1080, "best": None}
+    height = RESOLUTION_MAP.get(quality, 720)
+
+    if fmt == "mp3":
+        return "bestaudio/best", [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}]
+
+    if fmt == "webm":
+        if height:
+            fmt_str = f"best[ext=webm][height<={height}]/best[height<={height}]/best"
+        else:
+            fmt_str = "best[ext=webm]/best"
+        return fmt_str, []
+
+    # Default: mp4
+    if height:
+        fmt_str = f"best[ext=mp4][height<={height}]/best[height<={height}]/best"
+    else:
+        fmt_str = "best[ext=mp4]/best"
+    return fmt_str, []
 
 
 def find_downloaded_file(directory, prefix):
@@ -295,6 +328,8 @@ def download_full():
         return jsonify({"error": "Invalid request body."}), 400
 
     url = data.get("url", "")
+    quality = data.get("quality", "720p")
+    fmt = data.get("format", "mp4")
     platform, err = validate_url(url)
     if err:
         return jsonify({"error": err}), 400
@@ -305,11 +340,16 @@ def download_full():
 
     try:
         output_template = str(job_dir / "video.%(ext)s")
+        format_str, postprocessors = build_format_string(quality, fmt, is_trim=False)
 
-        opts = safe_ydl_opts({
-            "format": "best[ext=mp4]/best",
+        dl_opts = {
+            "format": format_str,
             "outtmpl": output_template,
-        })
+        }
+        if postprocessors:
+            dl_opts["postprocessors"] = postprocessors
+
+        opts = safe_ydl_opts(dl_opts)
 
         with yt_dlp.YoutubeDL(opts) as ydl:
             ydl.download([url])
@@ -337,6 +377,7 @@ def download_full():
         return jsonify({"error": "Download failed. The video may be unavailable or restricted."}), 500
     except Exception:
         cleanup_job_dir(job_dir)
+        logger.exception("download-full error")
         return jsonify({"error": "An unexpected error occurred during download."}), 500
 
 
@@ -358,6 +399,8 @@ def trim_video():
     url = data.get("url", "")
     start_time = data.get("start", "0:00")
     end_time = data.get("end", "0:00")
+    quality = data.get("quality", "720p")
+    fmt = data.get("format", "mp4")
 
     platform, err = validate_url(url)
     if err:
@@ -383,15 +426,20 @@ def trim_video():
 
     try:
         output_template = str(job_dir / "clip.%(ext)s")
+        format_str, postprocessors = build_format_string(quality, fmt, is_trim=True)
 
-        opts = safe_ydl_opts({
-            "format": "best[ext=mp4][height<=720]/best[height<=720]/best",
+        dl_opts = {
+            "format": format_str,
             "outtmpl": output_template,
             "download_ranges": yt_dlp.utils.download_range_func(
                 None, [(start_sec, end_sec)]
             ),
             "force_keyframes_at_cuts": True,
-        })
+        }
+        if postprocessors:
+            dl_opts["postprocessors"] = postprocessors
+
+        opts = safe_ydl_opts(dl_opts)
 
         with yt_dlp.YoutubeDL(opts) as ydl:
             ydl.download([url])
@@ -418,6 +466,7 @@ def trim_video():
         return jsonify({"error": "Trim failed. The video may be unavailable or the format unsupported."}), 500
     except Exception:
         cleanup_job_dir(job_dir)
+        logger.exception("trim error")
         return jsonify({"error": "An unexpected error occurred during trimming."}), 500
 
 
@@ -459,6 +508,8 @@ def upload_to_library(file_path, metadata):
             "tags": metadata.get("tags"),
             "is_favorite": False,
         }
+        if metadata.get("user_id"):
+            row["user_id"] = metadata["user_id"]
 
         result = sb.table("clips").insert(row).execute()
         return {"success": True, "url": public_url, "id": result.data[0]["id"] if result.data else None}
@@ -489,6 +540,8 @@ def save_to_library():
     channel = data.get("channel", "")
     vid_duration = data.get("duration", 0)
     tags = data.get("tags")  # comma-separated string or None
+    quality = data.get("quality", "720p")
+    fmt = data.get("format", "mp4")
 
     platform, err = validate_url(url)
     if err:
@@ -513,12 +566,16 @@ def save_to_library():
                 return jsonify({"error": "Clips limited to 10 minutes."}), 400
 
             output_template = str(job_dir / "clip.%(ext)s")
-            opts = safe_ydl_opts({
-                "format": "best[ext=mp4][height<=720]/best[height<=720]/best",
+            format_str, postprocessors = build_format_string(quality, fmt, is_trim=True)
+            dl_opts = {
+                "format": format_str,
                 "outtmpl": output_template,
                 "download_ranges": yt_dlp.utils.download_range_func(None, [(start_sec, end_sec)]),
                 "force_keyframes_at_cuts": True,
-            })
+            }
+            if postprocessors:
+                dl_opts["postprocessors"] = postprocessors
+            opts = safe_ydl_opts(dl_opts)
 
             with yt_dlp.YoutubeDL(opts) as ydl:
                 ydl.download([url])
@@ -526,10 +583,14 @@ def save_to_library():
             dl_file = find_downloaded_file(job_dir, "clip")
         else:
             output_template = str(job_dir / "video.%(ext)s")
-            opts = safe_ydl_opts({
-                "format": "best[ext=mp4]/best",
+            format_str, postprocessors = build_format_string(quality, fmt, is_trim=False)
+            dl_opts = {
+                "format": format_str,
                 "outtmpl": output_template,
-            })
+            }
+            if postprocessors:
+                dl_opts["postprocessors"] = postprocessors
+            opts = safe_ydl_opts(dl_opts)
 
             with yt_dlp.YoutubeDL(opts) as ydl:
                 ydl.download([url])
@@ -544,6 +605,7 @@ def save_to_library():
             return jsonify({"error": "File too large (>100MB)."}), 413
 
         # Upload to Supabase
+        user_id = require_auth()
         result = upload_to_library(dl_file, {
             "title": title,
             "platform": platform,
@@ -555,6 +617,7 @@ def save_to_library():
             "trim_end": data.get("end") if mode == "trim" else None,
             "mode": mode,
             "tags": tags,
+            "user_id": user_id,
         })
 
         cleanup_job_dir(job_dir)
@@ -573,6 +636,7 @@ def save_to_library():
         return jsonify({"error": "Download failed. The video may be unavailable."}), 500
     except Exception:
         cleanup_job_dir(job_dir)
+        logger.exception("save-to-library error")
         return jsonify({"error": "An unexpected error occurred."}), 500
 
 
@@ -580,16 +644,27 @@ def save_to_library():
 
 @app.route("/api/library", methods=["GET"])
 def get_library():
-    """Return all saved clips, newest first."""
+    """Return saved clips, newest first, with optional pagination."""
+    user_id = require_auth()
+    page = request.args.get("page", 1, type=int)
+    per_page = min(request.args.get("per_page", 20, type=int), 50)
+    offset = (page - 1) * per_page
+
     try:
-        result = sb.table("clips").select("*").order("created_at", desc=True).limit(100).execute()
+        query = sb.table("clips").select("*", count="exact")
+        if user_id:
+            query = query.eq("user_id", user_id)
+        query = query.order("created_at", desc=True).range(offset, offset + per_page - 1)
+        result = query.execute()
         clips = result.data or []
+        total = result.count or len(clips)
         # Add public URL to each clip
         for clip in clips:
             clip["download_url"] = sb.storage.from_("clips").get_public_url(clip["file_path"])
-        return jsonify({"clips": clips})
+        return jsonify({"clips": clips, "total": total, "has_more": offset + per_page < total})
     except Exception:
-        return jsonify({"clips": [], "error": "Could not load library."}), 500
+        logger.exception("get library error")
+        return jsonify({"clips": [], "total": 0, "has_more": False, "error": "Could not load library."}), 500
 
 
 @app.route("/api/library/<clip_id>", methods=["DELETE"])
@@ -599,9 +674,13 @@ def delete_clip(clip_id):
     if not re.match(r'^[a-f0-9-]{36}$', clip_id):
         return jsonify({"error": "Invalid clip ID."}), 400
 
+    user_id = require_auth()
     try:
         # Get the clip to find the file path
-        result = sb.table("clips").select("file_path").eq("id", clip_id).execute()
+        query = sb.table("clips").select("file_path").eq("id", clip_id)
+        if user_id:
+            query = query.eq("user_id", user_id)
+        result = query.execute()
         if not result.data:
             return jsonify({"error": "Clip not found."}), 404
 
@@ -614,10 +693,14 @@ def delete_clip(clip_id):
             pass  # Storage file may already be gone
 
         # Delete from database
-        sb.table("clips").delete().eq("id", clip_id).execute()
+        delete_q = sb.table("clips").delete().eq("id", clip_id)
+        if user_id:
+            delete_q = delete_q.eq("user_id", user_id)
+        delete_q.execute()
 
         return jsonify({"success": True})
     except Exception:
+        logger.exception("delete clip error")
         return jsonify({"error": "Could not delete clip."}), 500
 
 
@@ -629,15 +712,23 @@ def toggle_favorite(clip_id):
     if not re.match(r'^[a-f0-9-]{36}$', clip_id):
         return jsonify({"error": "Invalid clip ID."}), 400
 
+    user_id = require_auth()
     try:
-        result = sb.table("clips").select("is_favorite").eq("id", clip_id).execute()
+        query = sb.table("clips").select("is_favorite").eq("id", clip_id)
+        if user_id:
+            query = query.eq("user_id", user_id)
+        result = query.execute()
         if not result.data:
             return jsonify({"error": "Clip not found."}), 404
 
         current = result.data[0].get("is_favorite", False)
-        sb.table("clips").update({"is_favorite": not current}).eq("id", clip_id).execute()
+        update_q = sb.table("clips").update({"is_favorite": not current}).eq("id", clip_id)
+        if user_id:
+            update_q = update_q.eq("user_id", user_id)
+        update_q.execute()
         return jsonify({"success": True, "is_favorite": not current})
     except Exception:
+        logger.exception("toggle favorite error")
         return jsonify({"error": "Could not update favorite."}), 500
 
 
@@ -659,10 +750,14 @@ def bulk_delete():
         if not re.match(r'^[a-f0-9-]{36}$', cid):
             return jsonify({"error": f"Invalid clip ID: {cid}"}), 400
 
+    user_id = require_auth()
     deleted = 0
     try:
         # Get file paths for storage cleanup
-        result = sb.table("clips").select("id, file_path").in_("id", ids).execute()
+        query = sb.table("clips").select("id, file_path").in_("id", ids)
+        if user_id:
+            query = query.eq("user_id", user_id)
+        result = query.execute()
         if result.data:
             file_paths = [r["file_path"] for r in result.data if r.get("file_path")]
             # Delete from storage
@@ -673,12 +768,157 @@ def bulk_delete():
                     pass  # Some files may already be gone
 
             # Delete from database
-            sb.table("clips").delete().in_("id", ids).execute()
+            delete_q = sb.table("clips").delete().in_("id", ids)
+            if user_id:
+                delete_q = delete_q.eq("user_id", user_id)
+            delete_q.execute()
             deleted = len(result.data)
 
         return jsonify({"success": True, "deleted": deleted})
     except Exception:
+        logger.exception("bulk delete error")
         return jsonify({"error": "Could not delete clips."}), 500
+
+
+# ── API: Edit clip metadata ───────────────────────────────────────────────────
+
+@app.route("/api/library/<clip_id>", methods=["PATCH"])
+def edit_clip(clip_id):
+    """Update clip title and/or tags."""
+    if not re.match(r'^[a-f0-9-]{36}$', clip_id):
+        return jsonify({"error": "Invalid clip ID."}), 400
+
+    data = request.get_json(silent=True)
+    if not data:
+        return jsonify({"error": "Invalid request body."}), 400
+
+    # Build update dict
+    updates = {}
+    if "title" in data:
+        updates["title"] = str(data["title"])[:200]
+    if "tags" in data:
+        updates["tags"] = str(data["tags"])[:500] if data["tags"] else None
+
+    if not updates:
+        return jsonify({"error": "Nothing to update."}), 400
+
+    # Auth check (if auth enabled)
+    user_id = require_auth()
+    try:
+        query = sb.table("clips").update(updates).eq("id", clip_id)
+        if user_id:
+            query = query.eq("user_id", user_id)
+        result = query.execute()
+        if not result.data:
+            return jsonify({"error": "Clip not found."}), 404
+        return jsonify({"success": True})
+    except Exception:
+        logger.exception("edit clip error")
+        return jsonify({"error": "Could not update clip."}), 500
+
+
+# ── Auth helpers ─────────────────────────────────────────────────────────────
+
+SUPABASE_JWT_SECRET = os.environ.get("SUPABASE_JWT_SECRET", "")
+SUPABASE_ANON_KEY = os.environ.get("SUPABASE_KEY", "")
+
+# Anon client for auth operations
+try:
+    import jwt as pyjwt
+    anon_sb = create_client(SUPABASE_URL, SUPABASE_ANON_KEY) if SUPABASE_ANON_KEY else None
+except Exception:
+    pyjwt = None
+    anon_sb = None
+
+
+def get_current_user():
+    """Extract user_id from JWT Bearer token. Returns user_id or None."""
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer ") or not pyjwt or not SUPABASE_JWT_SECRET:
+        return None
+    token = auth_header[7:]
+    try:
+        payload = pyjwt.decode(token, SUPABASE_JWT_SECRET, algorithms=["HS256"], audience="authenticated")
+        return payload.get("sub")
+    except Exception:
+        return None
+
+
+def require_auth():
+    """Returns user_id if authenticated, None otherwise (graceful degradation)."""
+    return get_current_user()
+
+
+# ── API: Auth routes ─────────────────────────────────────────────────────────
+
+@app.route("/api/auth/signup", methods=["POST"])
+def auth_signup():
+    if not anon_sb:
+        return jsonify({"error": "Auth not configured."}), 503
+    data = request.get_json(silent=True)
+    if not data:
+        return jsonify({"error": "Invalid request."}), 400
+    email = data.get("email", "").strip()
+    password = data.get("password", "")
+    if not email or not password:
+        return jsonify({"error": "Email and password required."}), 400
+    if len(password) < 6:
+        return jsonify({"error": "Password must be at least 6 characters."}), 400
+    try:
+        result = anon_sb.auth.sign_up({"email": email, "password": password})
+        if result.user:
+            return jsonify({"success": True, "message": "Account created. Check your email to confirm."})
+        return jsonify({"error": "Signup failed."}), 400
+    except Exception as e:
+        return jsonify({"error": str(e)[:200]}), 400
+
+
+@app.route("/api/auth/login", methods=["POST"])
+def auth_login():
+    if not anon_sb:
+        return jsonify({"error": "Auth not configured."}), 503
+    data = request.get_json(silent=True)
+    if not data:
+        return jsonify({"error": "Invalid request."}), 400
+    email = data.get("email", "").strip()
+    password = data.get("password", "")
+    if not email or not password:
+        return jsonify({"error": "Email and password required."}), 400
+    try:
+        result = anon_sb.auth.sign_in_with_password({"email": email, "password": password})
+        if result.session:
+            return jsonify({
+                "success": True,
+                "access_token": result.session.access_token,
+                "refresh_token": result.session.refresh_token,
+                "user": {"id": result.user.id, "email": result.user.email},
+            })
+        return jsonify({"error": "Login failed."}), 401
+    except Exception as e:
+        return jsonify({"error": str(e)[:200]}), 401
+
+
+@app.route("/api/auth/refresh", methods=["POST"])
+def auth_refresh():
+    if not anon_sb:
+        return jsonify({"error": "Auth not configured."}), 503
+    data = request.get_json(silent=True)
+    if not data:
+        return jsonify({"error": "Invalid request."}), 400
+    refresh_token = data.get("refresh_token", "")
+    if not refresh_token:
+        return jsonify({"error": "Refresh token required."}), 400
+    try:
+        result = anon_sb.auth.refresh_session(refresh_token)
+        if result.session:
+            return jsonify({
+                "success": True,
+                "access_token": result.session.access_token,
+                "refresh_token": result.session.refresh_token,
+            })
+        return jsonify({"error": "Refresh failed."}), 401
+    except Exception as e:
+        return jsonify({"error": str(e)[:200]}), 401
 
 
 # ── Frontend HTML ────────────────────────────────────────────────────────────
@@ -719,6 +959,8 @@ INDEX_HTML = r"""<!DOCTYPE html>
   --tw: #1d9bf0;
   --ig: #e1306c;
   --tk: #00f2ea;
+  --twitch: #9146ff;
+  --sc: #ff5500;
   --radius-sm: 6px;
   --radius-md: 10px;
   --radius-lg: 14px;
@@ -831,6 +1073,8 @@ body {
 .platform-pill.tw svg { color: var(--tw); }
 .platform-pill.ig svg { color: var(--ig); }
 .platform-pill.tk svg { color: var(--tk); }
+.platform-pill.twitch svg { color: var(--twitch); }
+.platform-pill.sc svg { color: var(--sc); }
 
 .platform-pill.active {
   border-color: var(--accent);
@@ -889,6 +1133,8 @@ body {
 .platform-badge.twitter   { background: rgba(29,155,240,0.1); color: var(--tw); border: 1px solid rgba(29,155,240,0.2); }
 .platform-badge.instagram { background: rgba(225,48,108,0.1); color: var(--ig); border: 1px solid rgba(225,48,108,0.2); }
 .platform-badge.tiktok    { background: rgba(0,242,234,0.1); color: var(--tk); border: 1px solid rgba(0,242,234,0.2); }
+.platform-badge.twitch    { background: rgba(145,70,255,0.1); color: var(--twitch); border: 1px solid rgba(145,70,255,0.2); }
+.platform-badge.soundcloud { background: rgba(255,85,0,0.1); color: var(--sc); border: 1px solid rgba(255,85,0,0.2); }
 
 /* ── URL Input ──────────────────────────────────── */
 .url-group {
@@ -1467,6 +1713,7 @@ body {
   transition: all 0.2s ease;
 }
 .btn-confirm-save:hover { filter: brightness(1.1); box-shadow: 0 2px 12px var(--accent-glow); }
+.btn-confirm-save:active { transform: scale(0.98); }
 .btn-confirm-save:disabled { opacity: 0.35; cursor: not-allowed; }
 
 .btn-cancel-save {
@@ -1626,6 +1873,8 @@ body {
 .clip-platform-tag.twitter { background: rgba(29,155,240,0.9); color: #fff; }
 .clip-platform-tag.instagram { background: rgba(225,48,108,0.9); color: #fff; }
 .clip-platform-tag.tiktok { background: rgba(0,242,234,0.9); color: #000; }
+.clip-platform-tag.twitch { background: rgba(145,70,255,0.9); color: #fff; }
+.clip-platform-tag.soundcloud { background: rgba(255,85,0,0.9); color: #fff; }
 
 .clip-card-thumb .clip-mode-tag {
   position: absolute;
@@ -1812,6 +2061,252 @@ body {
 }
 .bulk-btn-delete:hover { background: var(--danger-dim); border-color: var(--danger); }
 
+/* ── Quality/Format Picker ──────────────────────── */
+.quality-section { display: none; margin-bottom: 1rem; }
+.quality-section.visible { display: block; animation: fadeIn 0.3s ease-out; }
+.quality-row { display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.5rem; }
+.quality-label {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.65rem;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  min-width: 55px;
+}
+.quality-group { display: flex; gap: 0.25rem; flex-wrap: wrap; }
+.quality-pill, .format-pill {
+  padding: 0.3rem 0.65rem;
+  border-radius: 100px;
+  font-size: 0.72rem;
+  font-weight: 500;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+.quality-pill:hover, .format-pill:hover { border-color: var(--border-light); color: var(--text-secondary); }
+.quality-pill.active, .format-pill.active { border-color: var(--accent); background: var(--accent-dim); color: var(--accent); }
+
+/* ── Edit Modal ────────────────────────────────── */
+.edit-modal-overlay {
+  display: none;
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,0.6);
+  backdrop-filter: blur(4px);
+  z-index: 100;
+  align-items: center;
+  justify-content: center;
+}
+.edit-modal-overlay.visible { display: flex; animation: fadeIn 0.2s ease-out; }
+.edit-modal {
+  background: var(--bg-panel);
+  border: 1px solid var(--border-light);
+  border-radius: var(--radius-lg);
+  padding: 1.5rem;
+  width: 420px;
+  max-width: 90vw;
+  max-height: 80vh;
+  overflow-y: auto;
+}
+.edit-modal h3 { font-size: 1rem; font-weight: 600; margin-bottom: 1rem; }
+.edit-modal label {
+  display: block;
+  font-size: 0.75rem;
+  font-weight: 500;
+  color: var(--text-secondary);
+  margin-bottom: 0.35rem;
+}
+.edit-modal input[type="text"] {
+  width: 100%;
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 0.6rem 0.75rem;
+  color: var(--text-primary);
+  font-family: inherit;
+  font-size: 0.85rem;
+  outline: none;
+  transition: border-color 0.2s, box-shadow 0.2s;
+  margin-bottom: 1rem;
+}
+.edit-modal input[type="text"]:focus { border-color: var(--border-focus); box-shadow: 0 0 0 3px var(--accent-dim); }
+.edit-modal-actions { display: flex; gap: 0.4rem; margin-top: 0.5rem; }
+.edit-modal-actions .btn-confirm-save { flex: 1; }
+
+/* ── Toast Notifications ───────────────────────── */
+.toast-container {
+  position: fixed;
+  bottom: 1.5rem;
+  right: 1.5rem;
+  z-index: 200;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  pointer-events: none;
+}
+.toast {
+  pointer-events: auto;
+  padding: 0.65rem 1rem;
+  border-radius: var(--radius-sm);
+  font-size: 0.8rem;
+  font-weight: 500;
+  color: var(--text-primary);
+  animation: toastIn 0.3s ease-out;
+  max-width: 320px;
+}
+.toast.toast-success { background: rgba(0,229,160,0.15); border: 1px solid rgba(0,229,160,0.3); color: var(--accent); }
+.toast.toast-error { background: var(--danger-dim); border: 1px solid rgba(244,63,94,0.3); color: var(--danger); }
+.toast.toast-info { background: var(--bg-elevated); border: 1px solid var(--border-light); }
+.toast.toast-out { animation: toastOut 0.3s ease-in forwards; }
+@keyframes toastIn { from { opacity: 0; transform: translateY(12px); } to { opacity: 1; transform: translateY(0); } }
+@keyframes toastOut { from { opacity: 1; transform: translateY(0); } to { opacity: 0; transform: translateY(12px); } }
+
+/* ── Auth Modal ────────────────────────────────── */
+.auth-modal-overlay {
+  display: none;
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,0.6);
+  backdrop-filter: blur(4px);
+  z-index: 100;
+  align-items: center;
+  justify-content: center;
+}
+.auth-modal-overlay.visible { display: flex; animation: fadeIn 0.2s ease-out; }
+.auth-modal {
+  background: var(--bg-panel);
+  border: 1px solid var(--border-light);
+  border-radius: var(--radius-lg);
+  padding: 1.75rem;
+  width: 380px;
+  max-width: 90vw;
+}
+.auth-modal h3 { font-size: 1.1rem; font-weight: 600; margin-bottom: 1.25rem; text-align: center; }
+.auth-input {
+  width: 100%;
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 0.7rem 0.85rem;
+  color: var(--text-primary);
+  font-family: inherit;
+  font-size: 0.9rem;
+  outline: none;
+  transition: border-color 0.2s, box-shadow 0.2s;
+  margin-bottom: 0.75rem;
+}
+.auth-input:focus { border-color: var(--border-focus); box-shadow: 0 0 0 3px var(--accent-dim); }
+.auth-input::placeholder { color: var(--text-muted); }
+.auth-error { display: none; color: var(--danger); font-size: 0.8rem; margin-bottom: 0.75rem; }
+.auth-error.visible { display: block; }
+.auth-submit {
+  width: 100%;
+  padding: 0.75rem;
+  background: var(--accent);
+  color: var(--bg-deep);
+  border: none;
+  border-radius: var(--radius-sm);
+  font-family: inherit;
+  font-size: 0.9rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  margin-bottom: 0.75rem;
+}
+.auth-submit:hover { filter: brightness(1.1); box-shadow: 0 4px 16px var(--accent-glow); }
+.auth-submit:disabled { opacity: 0.35; cursor: not-allowed; }
+.auth-toggle {
+  text-align: center;
+  font-size: 0.8rem;
+  color: var(--text-muted);
+}
+.auth-toggle a {
+  color: var(--accent);
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.user-bar {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.8rem;
+}
+.user-bar .user-email { color: var(--text-secondary); font-weight: 500; }
+.user-bar .btn-logout {
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 0.25rem 0.6rem;
+  color: var(--text-muted);
+  font-size: 0.7rem;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.15s;
+  font-family: inherit;
+}
+.user-bar .btn-logout:hover { border-color: var(--danger); color: var(--danger); }
+.btn-login-header {
+  background: transparent;
+  border: 1px solid var(--accent);
+  border-radius: var(--radius-sm);
+  padding: 0.3rem 0.8rem;
+  color: var(--accent);
+  font-size: 0.75rem;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.15s;
+  font-family: inherit;
+}
+.btn-login-header:hover { background: var(--accent-dim); }
+
+/* ── Skeleton Loading ──────────────────────────── */
+.skeleton-card {
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  overflow: hidden;
+}
+.skeleton-thumb {
+  width: 100%;
+  aspect-ratio: 16/9;
+  background: var(--bg-elevated);
+  animation: shimmer 1.5s ease-in-out infinite;
+}
+.skeleton-line {
+  height: 10px;
+  margin: 0.5rem 0.6rem;
+  border-radius: 4px;
+  background: var(--bg-elevated);
+  animation: shimmer 1.5s ease-in-out infinite;
+}
+.skeleton-line.short { width: 60%; }
+@keyframes shimmer {
+  0%, 100% { opacity: 0.4; }
+  50% { opacity: 0.8; }
+}
+
+/* ── Load More ─────────────────────────────────── */
+.btn-load-more {
+  display: none;
+  width: 100%;
+  padding: 0.6rem;
+  margin-top: 0.75rem;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text-secondary);
+  font-family: inherit;
+  font-size: 0.8rem;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+.btn-load-more:hover { border-color: var(--accent); color: var(--accent); background: var(--accent-dim); }
+.btn-load-more.visible { display: block; }
+
 /* ── Animations ─────────────────────────────────── */
 @keyframes fadeIn {
   from { opacity: 0; transform: translateY(4px); }
@@ -1833,7 +2328,12 @@ body {
 
   <!-- Header -->
   <header class="header">
-    <div class="logo">ClipForge</div>
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:0.5rem">
+      <div class="logo">ClipForge</div>
+      <div id="userArea">
+        <button type="button" class="btn-login-header" id="btnLoginHeader" onclick="showAuthModal('login')">Log in</button>
+      </div>
+    </div>
     <h1>Download & Trim Videos</h1>
     <p>Paste a link from any supported platform, trim it or download it directly.</p>
     <div class="platforms">
@@ -1853,6 +2353,14 @@ body {
         <svg viewBox="0 0 24 24" fill="currentColor"><path d="M19.59 6.69a4.83 4.83 0 0 1-3.77-4.25V2h-3.45v13.67a2.89 2.89 0 0 1-2.88 2.5 2.89 2.89 0 0 1-2.89-2.89 2.89 2.89 0 0 1 2.89-2.89c.28 0 .54.04.79.1v-3.5a6.37 6.37 0 0 0-.79-.05A6.34 6.34 0 0 0 3.15 15a6.34 6.34 0 0 0 6.34 6.34 6.34 6.34 0 0 0 6.34-6.34V8.1a8.16 8.16 0 0 0 4.76 1.52v-3.4a4.85 4.85 0 0 1-1-.07z"/></svg>
         TikTok
       </div>
+      <div class="platform-pill twitch" id="pillTwitch">
+        <svg viewBox="0 0 24 24" fill="currentColor"><path d="M11.571 4.714h1.715v5.143H11.57zm4.715 0H18v5.143h-1.714zM6 0L1.714 4.286v15.428h5.143V24l4.286-4.286h3.428L22.286 12V0zm14.571 11.143l-3.428 3.428h-3.429l-3 3v-3H6.857V1.714h13.714z"/></svg>
+        Twitch
+      </div>
+      <div class="platform-pill sc" id="pillSc">
+        <svg viewBox="0 0 24 24" fill="currentColor"><path d="M1.175 12.225c-.051 0-.094.046-.101.1l-.233 2.154.233 2.105c.007.058.05.098.101.098.05 0 .09-.04.099-.098l.255-2.105-.27-2.154c-.009-.06-.05-.1-.1-.1m-.899.828c-.06 0-.091.037-.104.094L0 14.479l.172 1.308c.013.06.045.094.104.094.057 0 .09-.037.104-.093l.2-1.31-.2-1.326c-.014-.057-.047-.094-.104-.094m1.81-1.153c-.074 0-.12.06-.12.135l-.217 2.443.217 2.36c0 .074.046.135.12.135.073 0 .119-.06.119-.135l.241-2.36-.241-2.443c0-.075-.046-.135-.12-.135m.943-.424c-.074 0-.135.065-.143.14l-.2 2.866.2 2.775c.008.074.07.14.143.14.074 0 .135-.066.143-.14l.227-2.775-.227-2.866c-.008-.075-.07-.14-.143-.14m.975-.263c-.09 0-.158.074-.158.166l-.176 3.13.176 2.992c0 .09.067.165.158.165.09 0 .157-.074.165-.165l.2-2.993-.2-3.13c-.008-.09-.074-.165-.165-.165m1.02-.296c-.1 0-.18.082-.18.182l-.156 3.427.156 3.083c0 .1.08.182.18.182.098 0 .178-.082.186-.182l.176-3.083-.176-3.427c-.008-.1-.088-.182-.186-.182m1.057-.191c-.112 0-.2.09-.2.2l-.143 3.618.143 3.14c0 .112.088.2.2.2.111 0 .2-.088.2-.2l.159-3.14-.16-3.618c0-.111-.088-.2-.2-.2m1.099.018c-.12 0-.217.098-.217.218l-.118 3.4.118 3.167c0 .12.097.217.217.217s.217-.097.217-.217l.131-3.167-.131-3.4c0-.12-.097-.218-.217-.218m1.123-.473c-.133 0-.24.108-.24.24l-.1 3.855.1 3.208c0 .134.107.241.24.241s.24-.107.24-.24l.114-3.21-.114-3.854c0-.133-.107-.241-.24-.241m1.14-.12c-.146 0-.26.116-.26.262l-.085 3.975.085 3.233c0 .146.114.262.26.262.144 0 .26-.116.26-.262l.096-3.233-.096-3.975c0-.146-.116-.262-.26-.262m1.175-.213c-.158 0-.283.126-.283.283l-.07 4.188.07 3.246c0 .158.126.283.283.283.158 0 .283-.126.283-.283l.078-3.246-.078-4.188c0-.157-.125-.283-.283-.283m1.21-.362c-.17 0-.307.137-.307.307l-.053 4.55.053 3.253c0 .17.138.307.308.307.17 0 .307-.137.307-.307l.06-3.253-.06-4.55c0-.17-.137-.307-.307-.307m1.251.065c-.183 0-.33.148-.33.33l-.04 4.154.04 3.265c0 .183.147.33.33.33.182 0 .33-.147.33-.33l.044-3.265-.044-4.154c0-.182-.148-.33-.33-.33m1.281-.29c-.197 0-.354.158-.354.354l-.025 4.444.025 3.27c0 .196.157.353.354.353.195 0 .353-.157.353-.353l.028-3.27-.028-4.443c0-.197-.158-.355-.353-.355m1.318-.133c-.208 0-.375.168-.375.375l-.01 4.577.01 3.273c0 .208.167.375.375.375.209 0 .375-.167.375-.375l.012-3.273-.012-4.577c0-.207-.166-.375-.375-.375m3.472 2.168c-.26 0-.5.057-.727.156a3.055 3.055 0 0 0-3.057-2.884c-.21 0-.415.025-.612.074-.132.03-.165.073-.165.145v5.784c0 .076.06.14.135.148h4.426a2.17 2.17 0 0 0 2.17-2.172 2.17 2.17 0 0 0-2.17-2.251z"/></svg>
+        SoundCloud
+      </div>
     </div>
   </header>
 
@@ -1866,7 +2374,7 @@ body {
         <label class="panel-label" for="urlInput"><span class="dot"></span> Source</label>
         <div class="url-group">
           <input type="text" class="url-input" id="urlInput"
-                 placeholder="Paste a YouTube, Twitter, Instagram, or TikTok URL..."
+                 placeholder="Paste a YouTube, Twitter, Instagram, TikTok, Twitch, or SoundCloud URL..."
                  spellcheck="false" autocomplete="off">
           <button type="button" class="btn-load" id="btnLoad" onclick="loadVideo()">Load</button>
         </div>
@@ -1894,6 +2402,28 @@ body {
       <div class="mode-toggle" id="modeToggle">
         <button type="button" class="mode-btn active" id="modeDownload" onclick="setMode('download')">Download Full</button>
         <button type="button" class="mode-btn" id="modeTrim" onclick="setMode('trim')">Trim & Download</button>
+      </div>
+
+      <!-- Quality/Format Picker -->
+      <div class="quality-section" id="qualitySection">
+        <div class="quality-row">
+          <span class="quality-label">Quality</span>
+          <div class="quality-group" id="qualityGroup">
+            <button type="button" class="quality-pill" data-q="360p">360p</button>
+            <button type="button" class="quality-pill" data-q="480p">480p</button>
+            <button type="button" class="quality-pill active" data-q="720p">720p</button>
+            <button type="button" class="quality-pill" data-q="1080p">1080p</button>
+            <button type="button" class="quality-pill" data-q="best">Best</button>
+          </div>
+        </div>
+        <div class="quality-row">
+          <span class="quality-label">Format</span>
+          <div class="quality-group" id="formatGroup">
+            <button type="button" class="format-pill active" data-f="mp4">MP4</button>
+            <button type="button" class="format-pill" data-f="webm">WebM</button>
+            <button type="button" class="format-pill" data-f="mp3">MP3</button>
+          </div>
+        </div>
       </div>
 
       <!-- Timeline (trim mode) -->
@@ -1992,6 +2522,8 @@ body {
             <button type="button" class="filter-pill" onclick="setFilter('twitter')">Twitter</button>
             <button type="button" class="filter-pill" onclick="setFilter('instagram')">Instagram</button>
             <button type="button" class="filter-pill" onclick="setFilter('tiktok')">TikTok</button>
+            <button type="button" class="filter-pill" onclick="setFilter('twitch')">Twitch</button>
+            <button type="button" class="filter-pill" onclick="setFilter('soundcloud')">SoundCloud</button>
           </div>
           <div class="library-sort-row">
             <select class="library-sort" id="librarySort" onchange="applyLibraryView()">
@@ -2015,6 +2547,8 @@ body {
           </div>
         </div>
 
+        <button type="button" class="btn-load-more" id="btnLoadMore" onclick="loadMoreClips()">Load more</button>
+
         <!-- Bulk Action Bar -->
         <div class="bulk-bar" id="bulkBar">
           <span class="bulk-bar-info" id="bulkBarInfo">0 selected</span>
@@ -2030,6 +2564,42 @@ body {
 
 </div>
 
+<!-- Edit Modal -->
+<div class="edit-modal-overlay" id="editModalOverlay" onclick="if(event.target===this)closeEditModal()">
+  <div class="edit-modal">
+    <h3>Edit Clip</h3>
+    <input type="hidden" id="editClipId">
+    <label for="editTitleInput">Title</label>
+    <input type="text" id="editTitleInput" placeholder="Clip title..." maxlength="200">
+    <label>Tags <span style="font-size:0.7rem;font-weight:400;color:var(--text-muted)">(Enter to add)</span></label>
+    <div class="tag-input-wrap" id="editTagInputWrap" onclick="document.getElementById('editTagField').focus()">
+      <input type="text" class="tag-input-field" id="editTagField" placeholder="Add a tag...">
+    </div>
+    <div class="edit-modal-actions">
+      <button type="button" class="btn-confirm-save" onclick="saveEdit()">Save Changes</button>
+      <button type="button" class="btn-cancel-save" onclick="closeEditModal()">Cancel</button>
+    </div>
+  </div>
+</div>
+
+<!-- Auth Modal -->
+<div class="auth-modal-overlay" id="authModalOverlay" onclick="if(event.target===this)closeAuthModal()">
+  <div class="auth-modal">
+    <h3 id="authModalTitle">Log In</h3>
+    <input type="email" class="auth-input" id="authEmail" placeholder="Email address">
+    <input type="password" class="auth-input" id="authPassword" placeholder="Password">
+    <div class="auth-error" id="authError"></div>
+    <button type="button" class="auth-submit" id="authSubmit" onclick="submitAuth()">Log In</button>
+    <div class="auth-toggle">
+      <span id="authToggleText">Don't have an account?</span>
+      <a id="authToggleLink" onclick="toggleAuthMode()">Sign up</a>
+    </div>
+  </div>
+</div>
+
+<!-- Toast Container -->
+<div class="toast-container" id="toastContainer"></div>
+
 <script>
 let videoDuration = 0;
 let videoId = '';
@@ -2037,17 +2607,29 @@ let currentPlatform = '';
 let currentMode = 'download';
 let dragging = null;
 
+// Quality/format state
+let currentQuality = '720p';
+let currentFormat = 'mp4';
+
 // Library state
 let allClips = [];
 let currentFilter = 'all';
 let selectedClipIds = new Set();
 let saveTags = [];
+let editTags = [];
+let libraryPage = 1;
+let libraryHasMore = false;
+
+// Auth state
+let authMode = 'login'; // 'login' or 'signup'
 
 const PLATFORM_LABELS = {
-  youtube:   'YouTube',
-  twitter:   'Twitter / X',
-  instagram: 'Instagram',
-  tiktok:    'TikTok',
+  youtube:    'YouTube',
+  twitter:    'Twitter / X',
+  instagram:  'Instagram',
+  tiktok:     'TikTok',
+  twitch:     'Twitch',
+  soundcloud: 'SoundCloud',
 };
 
 const PLATFORM_ICONS = {
@@ -2055,6 +2637,8 @@ const PLATFORM_ICONS = {
   twitter:   '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24H16.17l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25H8.08l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/></svg>',
   instagram: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 2.16c3.2 0 3.58.01 4.85.07 3.25.15 4.77 1.69 4.92 4.92.06 1.27.07 1.65.07 4.85s-.01 3.58-.07 4.85c-.15 3.23-1.66 4.77-4.92 4.92-1.27.06-1.65.07-4.85.07s-3.58-.01-4.85-.07c-3.26-.15-4.77-1.7-4.92-4.92-.06-1.27-.07-1.65-.07-4.85s.01-3.58.07-4.85C2.38 3.86 3.9 2.31 7.15 2.23 8.42 2.17 8.8 2.16 12 2.16zM12 0C8.74 0 8.33.01 7.05.07 2.7.27.27 2.7.07 7.05.01 8.33 0 8.74 0 12s.01 3.67.07 4.95c.2 4.36 2.62 6.78 6.98 6.98C8.33 23.99 8.74 24 12 24s3.67-.01 4.95-.07c4.35-.2 6.78-2.62 6.98-6.98.06-1.28.07-1.69.07-4.95s-.01-3.67-.07-4.95c-.2-4.35-2.63-6.78-6.98-6.98C15.67.01 15.26 0 12 0zm0 5.84A6.16 6.16 0 1 0 18.16 12 6.16 6.16 0 0 0 12 5.84zM12 16a4 4 0 1 1 4-4 4 4 0 0 1-4 4zm6.4-11.85a1.44 1.44 0 1 0 1.44 1.44 1.44 1.44 0 0 0-1.44-1.44z"/></svg>',
   tiktok:    '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M19.59 6.69a4.83 4.83 0 0 1-3.77-4.25V2h-3.45v13.67a2.89 2.89 0 0 1-2.88 2.5 2.89 2.89 0 0 1-2.89-2.89 2.89 2.89 0 0 1 2.89-2.89c.28 0 .54.04.79.1v-3.5a6.37 6.37 0 0 0-.79-.05A6.34 6.34 0 0 0 3.15 15a6.34 6.34 0 0 0 6.34 6.34 6.34 6.34 0 0 0 6.34-6.34V8.1a8.16 8.16 0 0 0 4.76 1.52v-3.4a4.85 4.85 0 0 1-1-.07z"/></svg>',
+  twitch:    '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M11.571 4.714h1.715v5.143H11.57zm4.715 0H18v5.143h-1.714zM6 0L1.714 4.286v15.428h5.143V24l4.286-4.286h3.428L22.286 12V0zm14.571 11.143l-3.428 3.428h-3.429l-3 3v-3H6.857V1.714h13.714z"/></svg>',
+  soundcloud:'<svg viewBox="0 0 24 24" fill="currentColor"><path d="M1.175 12.225c-.051 0-.094.046-.101.1l-.233 2.154.233 2.105c.007.058.05.098.101.098.05 0 .09-.04.099-.098l.255-2.105-.27-2.154c-.009-.06-.05-.1-.1-.1m-.899.828c-.06 0-.091.037-.104.094L0 14.479l.172 1.308c.013.06.045.094.104.094.057 0 .09-.037.104-.093l.2-1.31-.2-1.326c-.014-.057-.047-.094-.104-.094m1.81-1.153c-.074 0-.12.06-.12.135l-.217 2.443.217 2.36c0 .074.046.135.12.135.073 0 .119-.06.119-.135l.241-2.36-.241-2.443c0-.075-.046-.135-.12-.135m.943-.424c-.074 0-.135.065-.143.14l-.2 2.866.2 2.775c.008.074.07.14.143.14.074 0 .135-.066.143-.14l.227-2.775-.227-2.866c-.008-.075-.07-.14-.143-.14m.975-.263c-.09 0-.158.074-.158.166l-.176 3.13.176 2.992c0 .09.067.165.158.165.09 0 .157-.074.165-.165l.2-2.993-.2-3.13c-.008-.09-.074-.165-.165-.165m1.02-.296c-.1 0-.18.082-.18.182l-.156 3.427.156 3.083c0 .1.08.182.18.182.098 0 .178-.082.186-.182l.176-3.083-.176-3.427c-.008-.1-.088-.182-.186-.182m1.057-.191c-.112 0-.2.09-.2.2l-.143 3.618.143 3.14c0 .112.088.2.2.2.111 0 .2-.088.2-.2l.159-3.14-.16-3.618c0-.111-.088-.2-.2-.2m1.099.018c-.12 0-.217.098-.217.218l-.118 3.4.118 3.167c0 .12.097.217.217.217s.217-.097.217-.217l.131-3.167-.131-3.4c0-.12-.097-.218-.217-.218m1.123-.473c-.133 0-.24.108-.24.24l-.1 3.855.1 3.208c0 .134.107.241.24.241s.24-.107.24-.24l.114-3.21-.114-3.854c0-.133-.107-.241-.24-.241m1.14-.12c-.146 0-.26.116-.26.262l-.085 3.975.085 3.233c0 .146.114.262.26.262.144 0 .26-.116.26-.262l.096-3.233-.096-3.975c0-.146-.116-.262-.26-.262m1.175-.213c-.158 0-.283.126-.283.283l-.07 4.188.07 3.246c0 .158.126.283.283.283.158 0 .283-.126.283-.283l.078-3.246-.078-4.188c0-.157-.125-.283-.283-.283m1.21-.362c-.17 0-.307.137-.307.307l-.053 4.55.053 3.253c0 .17.138.307.308.307.17 0 .307-.137.307-.307l.06-3.253-.06-4.55c0-.17-.137-.307-.307-.307m1.251.065c-.183 0-.33.148-.33.33l-.04 4.154.04 3.265c0 .183.147.33.33.33.182 0 .33-.147.33-.33l.044-3.265-.044-4.154c0-.182-.148-.33-.33-.33m1.281-.29c-.197 0-.354.158-.354.354l-.025 4.444.025 3.27c0 .196.157.353.354.353.195 0 .353-.157.353-.353l.028-3.27-.028-4.443c0-.197-.158-.355-.353-.355m1.318-.133c-.208 0-.375.168-.375.375l-.01 4.577.01 3.273c0 .208.167.375.375.375.209 0 .375-.167.375-.375l.012-3.273-.012-4.577c0-.207-.166-.375-.375-.375m3.472 2.168c-.26 0-.5.057-.727.156a3.055 3.055 0 0 0-3.057-2.884c-.21 0-.415.025-.612.074-.132.03-.165.073-.165.145v5.784c0 .076.06.14.135.148h4.426a2.17 2.17 0 0 0 2.17-2.172 2.17 2.17 0 0 0-2.17-2.251z"/></svg>',
 };
 
 // ── Detect platform from URL ────────────────
@@ -2064,6 +2648,8 @@ function detectPlatform(url) {
   if (/twitter\.com|x\.com/.test(url)) return 'twitter';
   if (/instagram\.com/.test(url)) return 'instagram';
   if (/tiktok\.com|vm\.tiktok/.test(url)) return 'tiktok';
+  if (/twitch\.tv/.test(url)) return 'twitch';
+  if (/soundcloud\.com/.test(url)) return 'soundcloud';
   return null;
 }
 
@@ -2075,6 +2661,13 @@ document.getElementById('urlInput').addEventListener('input', function() {
   else if (p === 'twitter') document.getElementById('pillTw').classList.add('active');
   else if (p === 'instagram') document.getElementById('pillIg').classList.add('active');
   else if (p === 'tiktok') document.getElementById('pillTk').classList.add('active');
+  else if (p === 'twitch') document.getElementById('pillTwitch').classList.add('active');
+  else if (p === 'soundcloud') document.getElementById('pillSc').classList.add('active');
+  // Auto-select MP3 for SoundCloud
+  if (p === 'soundcloud') {
+    currentFormat = 'mp3';
+    updateFormatPills();
+  }
 });
 
 // ── Load Video ──────────────────────────────
@@ -2087,7 +2680,7 @@ async function loadVideo() {
 
   const platform = detectPlatform(url);
   if (!platform) {
-    showError('urlError', 'Unsupported URL. Paste a YouTube, Twitter/X, Instagram, or TikTok link.');
+    showError('urlError', 'Unsupported URL. Paste a YouTube, Twitter/X, Instagram, TikTok, Twitch, or SoundCloud link.');
     return;
   }
 
@@ -2159,6 +2752,7 @@ async function loadVideo() {
     // Show sections
     document.getElementById('previewSection').classList.add('visible');
     document.getElementById('modeToggle').classList.add('visible');
+    document.getElementById('qualitySection').classList.add('visible');
     document.getElementById('actionSection').classList.add('visible');
 
     // Default mode: download for short videos / non-YT, trim for YT
@@ -2309,13 +2903,13 @@ async function startAction() {
     }
 
     endpoint = '/api/trim';
-    body = { url, start, end };
+    body = { url, start, end, quality: currentQuality, format: currentFormat };
     infoText = `Trimmed from ${start} to ${end}`;
     document.getElementById('progressStatus').innerHTML =
       '<span class="spinner"></span> Downloading & trimming your clip...';
   } else {
     endpoint = '/api/download-full';
-    body = { url };
+    body = { url, quality: currentQuality, format: currentFormat };
     infoText = `Full video from ${PLATFORM_LABELS[currentPlatform] || 'source'}`;
     document.getElementById('progressStatus').innerHTML =
       '<span class="spinner"></span> Downloading video...';
@@ -2396,13 +2990,20 @@ function resetAll() {
   ['previewSection','timelineSection','actionSection','progressSection','downloadSection'].forEach(id =>
     document.getElementById(id).classList.remove('visible'));
   document.getElementById('modeToggle').classList.remove('visible');
+  document.getElementById('qualitySection').classList.remove('visible');
   document.getElementById('urlInput').value = '';
+  document.getElementById('urlInput').focus();
   document.getElementById('btnAction').disabled = false;
   document.querySelectorAll('.platform-pill').forEach(el => el.classList.remove('active'));
+  document.querySelectorAll('.error-msg').forEach(el => el.classList.remove('visible'));
   videoDuration = 0;
   videoId = '';
   currentPlatform = '';
   currentMode = 'download';
+  currentQuality = '720p';
+  currentFormat = 'mp4';
+  updateQualityPills();
+  updateFormatPills();
 }
 
 // ── Utilities ───────────────────────────────
@@ -2500,6 +3101,8 @@ async function saveToLibrary() {
     channel: document.getElementById('videoChannel').textContent,
     duration: videoDuration,
     tags: tagsStr,
+    quality: currentQuality,
+    format: currentFormat,
   };
 
   if (currentMode === 'trim') {
@@ -2508,7 +3111,7 @@ async function saveToLibrary() {
   }
 
   try {
-    const resp = await fetch('/api/save-to-library', {
+    const resp = await authFetch('/api/save-to-library', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
@@ -2516,6 +3119,7 @@ async function saveToLibrary() {
     const data = await resp.json();
 
     if (!resp.ok) {
+      showToast(data.error || 'Save failed', 'error');
       btn.textContent = 'Save Failed';
       btn.disabled = false;
       setTimeout(() => { btn.textContent = 'Confirm & Save'; }, 2000);
@@ -2527,22 +3131,66 @@ async function saveToLibrary() {
     saveBtn.textContent = 'Saved!';
     saveBtn.classList.add('saved');
     saveBtn.style.display = '';
+    showToast('Clip saved to library!', 'success');
     loadLibrary();
   } catch (e) {
+    showToast('Save failed — network error', 'error');
     btn.textContent = 'Save Failed';
     btn.disabled = false;
     setTimeout(() => { btn.textContent = 'Confirm & Save'; }, 2000);
   }
 }
 
-async function loadLibrary() {
+async function loadLibrary(append = false) {
+  if (!append) {
+    libraryPage = 1;
+    // Show cached data immediately
+    const cached = localStorage.getItem('clipforge_library');
+    if (cached) {
+      try {
+        allClips = JSON.parse(cached);
+        applyLibraryView();
+      } catch(e) {}
+    } else {
+      showLibrarySkeleton();
+    }
+  }
+
   try {
-    const resp = await fetch('/api/library');
+    const resp = await authFetch('/api/library?page=' + libraryPage + '&per_page=20');
     const data = await resp.json();
-    allClips = data.clips || [];
+    if (append) {
+      allClips = allClips.concat(data.clips || []);
+    } else {
+      allClips = data.clips || [];
+    }
+    libraryHasMore = data.has_more || false;
+    // Cache
+    localStorage.setItem('clipforge_library', JSON.stringify(allClips));
     applyLibraryView();
+    // Show/hide load more
+    const btn = document.getElementById('btnLoadMore');
+    btn.classList.toggle('visible', libraryHasMore);
   } catch (e) {
-    // silently fail
+    // silently fail if network error
+  }
+}
+
+function loadMoreClips() {
+  libraryPage++;
+  loadLibrary(true);
+}
+
+function showLibrarySkeleton() {
+  const grid = document.getElementById('libraryGrid');
+  const empty = document.getElementById('libraryEmpty');
+  empty.style.display = 'none';
+  grid.querySelectorAll('.clip-card, .skeleton-card').forEach(el => el.remove());
+  for (let i = 0; i < 4; i++) {
+    const sk = document.createElement('div');
+    sk.className = 'skeleton-card';
+    sk.innerHTML = '<div class="skeleton-thumb"></div><div class="skeleton-line"></div><div class="skeleton-line short"></div>';
+    grid.appendChild(sk);
   }
 }
 
@@ -2587,14 +3235,14 @@ function setFilter(platform) {
   });
   // Simpler: re-apply active by matching
   const pills = document.querySelectorAll('#libraryFilters .filter-pill');
-  const labels = ['all', 'youtube', 'twitter', 'instagram', 'tiktok'];
+  const labels = ['all', 'youtube', 'twitter', 'instagram', 'tiktok', 'twitch', 'soundcloud'];
   pills.forEach((el, i) => el.classList.toggle('active', labels[i] === platform));
   applyLibraryView();
 }
 
 async function toggleFavorite(clipId) {
   try {
-    const resp = await fetch('/api/library/' + clipId + '/favorite', { method: 'PATCH' });
+    const resp = await authFetch('/api/library/' + clipId + '/favorite', { method: 'PATCH' });
     const data = await resp.json();
     if (data.success) {
       const clip = allClips.find(c => c.id === clipId);
@@ -2660,7 +3308,7 @@ function updateBulkBar() {
 async function bulkDelete() {
   if (!confirm('Delete ' + selectedClipIds.size + ' clip(s) permanently?')) return;
   try {
-    const resp = await fetch('/api/library/bulk-delete', {
+    const resp = await authFetch('/api/library/bulk-delete', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ ids: Array.from(selectedClipIds) }),
@@ -2668,6 +3316,7 @@ async function bulkDelete() {
     if (resp.ok) {
       selectedClipIds.clear();
       updateBulkBar();
+      showToast('Clips deleted', 'success');
       loadLibrary();
     }
   } catch (e) { /* ignore */ }
@@ -2692,7 +3341,7 @@ function renderLibrary(clips) {
   const empty = document.getElementById('libraryEmpty');
   const stats = document.getElementById('libraryStats');
 
-  grid.querySelectorAll('.clip-card').forEach(el => el.remove());
+  grid.querySelectorAll('.clip-card, .skeleton-card').forEach(el => el.remove());
 
   if (clips.length === 0) {
     empty.style.display = '';
@@ -2740,7 +3389,7 @@ function renderLibrary(clips) {
         '<span class="clip-platform-tag ' + clip.platform + '">' + (PLATFORM_LABELS[clip.platform] || clip.platform) + '</span>' +
       '</div>' +
       '<div class="clip-card-body">' +
-        '<h4>' + escapeHtml(clip.title) + '</h4>' +
+        '<h4 style="cursor:pointer" onclick="openEditModal(\'' + clip.id + '\')" title="Click to edit">' + escapeHtml(clip.title) + '</h4>' +
         tagsHtml +
         '<div class="clip-meta">' + escapeHtml(clip.channel || '') + ' \u00b7 ' + dateStr + ' \u00b7 ' + formatFileSize(clip.file_size || 0) + '</div>' +
         '<div class="clip-card-actions">' +
@@ -2759,13 +3408,14 @@ async function deleteClip(id, btnEl) {
   btnEl.disabled = true;
 
   try {
-    const resp = await fetch('/api/library/' + id, { method: 'DELETE' });
+    const resp = await authFetch('/api/library/' + id, { method: 'DELETE' });
     if (resp.ok) {
       const card = btnEl.closest('.clip-card');
       card.style.opacity = '0';
       card.style.transform = 'scale(0.9)';
       selectedClipIds.delete(id);
       updateBulkBar();
+      showToast('Clip deleted', 'success');
       setTimeout(() => { card.remove(); loadLibrary(); }, 300);
     }
   } catch (e) {
@@ -2789,7 +3439,316 @@ function escapeAttr(str) {
   return str.replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/'/g,'&#39;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
 
-// Load library on page load
+// ── Quality/Format Pill Handlers ────────────
+document.querySelectorAll('#qualityGroup .quality-pill').forEach(btn => {
+  btn.addEventListener('click', () => {
+    currentQuality = btn.dataset.q;
+    updateQualityPills();
+  });
+});
+
+document.querySelectorAll('#formatGroup .format-pill').forEach(btn => {
+  btn.addEventListener('click', () => {
+    currentFormat = btn.dataset.f;
+    updateFormatPills();
+  });
+});
+
+function updateQualityPills() {
+  document.querySelectorAll('#qualityGroup .quality-pill').forEach(p =>
+    p.classList.toggle('active', p.dataset.q === currentQuality));
+}
+
+function updateFormatPills() {
+  document.querySelectorAll('#formatGroup .format-pill').forEach(p =>
+    p.classList.toggle('active', p.dataset.f === currentFormat));
+  // MP3: hide quality row + hide trim section
+  const qRow = document.querySelector('#qualityGroup').parentElement;
+  if (currentFormat === 'mp3') {
+    qRow.style.display = 'none';
+    if (currentMode === 'trim') setMode('download');
+    document.getElementById('modeTrim').style.display = 'none';
+  } else {
+    qRow.style.display = '';
+    document.getElementById('modeTrim').style.display = '';
+  }
+}
+
+// ── Toast Notifications ────────────────────
+function showToast(message, type = 'info', duration = 3500) {
+  const container = document.getElementById('toastContainer');
+  const toast = document.createElement('div');
+  toast.className = 'toast toast-' + type;
+  toast.textContent = message;
+  container.appendChild(toast);
+  setTimeout(() => {
+    toast.classList.add('toast-out');
+    setTimeout(() => toast.remove(), 300);
+  }, duration);
+}
+
+// ── Edit Modal ─────────────────────────────
+function openEditModal(clipId) {
+  const clip = allClips.find(c => c.id === clipId);
+  if (!clip) return;
+  document.getElementById('editClipId').value = clipId;
+  document.getElementById('editTitleInput').value = clip.title || '';
+  editTags = clip.tags ? clip.tags.split(',').map(t => t.trim()).filter(Boolean) : [];
+  renderEditTags();
+  document.getElementById('editModalOverlay').classList.add('visible');
+  document.getElementById('editTitleInput').focus();
+}
+
+function closeEditModal() {
+  document.getElementById('editModalOverlay').classList.remove('visible');
+}
+
+function renderEditTags() {
+  const wrap = document.getElementById('editTagInputWrap');
+  wrap.querySelectorAll('.tag-chip').forEach(el => el.remove());
+  const field = document.getElementById('editTagField');
+  editTags.forEach((tag, i) => {
+    const chip = document.createElement('span');
+    chip.className = 'tag-chip';
+    chip.innerHTML = escapeHtml(tag) + '<span class="tag-remove">&times;</span>';
+    chip.querySelector('.tag-remove').onclick = () => { editTags.splice(i, 1); renderEditTags(); };
+    wrap.insertBefore(chip, field);
+  });
+}
+
+document.getElementById('editTagField').addEventListener('keydown', function(e) {
+  if ((e.key === 'Enter' || e.key === ',') && this.value.trim()) {
+    e.preventDefault();
+    const tag = this.value.trim().replace(/,/g, '').substring(0, 30);
+    if (tag && editTags.length < 10 && !editTags.includes(tag)) {
+      editTags.push(tag);
+      renderEditTags();
+    }
+    this.value = '';
+  }
+  if (e.key === 'Backspace' && !this.value && editTags.length > 0) {
+    editTags.pop();
+    renderEditTags();
+  }
+});
+
+async function saveEdit() {
+  const clipId = document.getElementById('editClipId').value;
+  const title = document.getElementById('editTitleInput').value.trim();
+  const tagsStr = editTags.length > 0 ? editTags.join(',') : null;
+
+  try {
+    const resp = await authFetch('/api/library/' + clipId, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title, tags: tagsStr }),
+    });
+    const data = await resp.json();
+    if (data.success) {
+      // Update local cache
+      const clip = allClips.find(c => c.id === clipId);
+      if (clip) {
+        clip.title = title;
+        clip.tags = tagsStr;
+      }
+      closeEditModal();
+      applyLibraryView();
+      showToast('Clip updated!', 'success');
+    } else {
+      showToast(data.error || 'Update failed', 'error');
+    }
+  } catch (e) {
+    showToast('Update failed — network error', 'error');
+  }
+}
+
+// ── Auth Helpers ────────────────────────────
+function getAuthState() {
+  try {
+    const s = localStorage.getItem('clipforge_auth');
+    return s ? JSON.parse(s) : null;
+  } catch { return null; }
+}
+
+function setAuthState(state) {
+  if (state) {
+    localStorage.setItem('clipforge_auth', JSON.stringify(state));
+  } else {
+    localStorage.removeItem('clipforge_auth');
+  }
+}
+
+function isLoggedIn() {
+  return !!getAuthState()?.accessToken;
+}
+
+function authHeaders() {
+  const state = getAuthState();
+  if (state?.accessToken) {
+    return { 'Authorization': 'Bearer ' + state.accessToken };
+  }
+  return {};
+}
+
+async function authFetch(url, options = {}) {
+  options.headers = { ...authHeaders(), ...(options.headers || {}) };
+  let resp = await fetchWithRetry(url, options);
+
+  // Auto-refresh on 401
+  if (resp.status === 401 && isLoggedIn()) {
+    const refreshed = await refreshToken();
+    if (refreshed) {
+      options.headers = { ...authHeaders(), ...(options.headers || {}) };
+      resp = await fetchWithRetry(url, options);
+    }
+  }
+  return resp;
+}
+
+async function fetchWithRetry(url, options, maxRetries = 2) {
+  let lastError;
+  for (let i = 0; i <= maxRetries; i++) {
+    try {
+      const resp = await fetch(url, options);
+      if (resp.status >= 500 && i < maxRetries) {
+        await new Promise(r => setTimeout(r, 500 * (i + 1)));
+        continue;
+      }
+      return resp;
+    } catch (e) {
+      lastError = e;
+      if (i < maxRetries) await new Promise(r => setTimeout(r, 500 * (i + 1)));
+    }
+  }
+  throw lastError;
+}
+
+async function refreshToken() {
+  const state = getAuthState();
+  if (!state?.refreshToken) return false;
+  try {
+    const resp = await fetch('/api/auth/refresh', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ refresh_token: state.refreshToken }),
+    });
+    const data = await resp.json();
+    if (data.success) {
+      state.accessToken = data.access_token;
+      state.refreshToken = data.refresh_token;
+      setAuthState(state);
+      return true;
+    }
+  } catch {}
+  // Refresh failed, log out
+  logout();
+  return false;
+}
+
+// ── Auth UI ─────────────────────────────────
+function showAuthModal(mode) {
+  authMode = mode || 'login';
+  document.getElementById('authModalTitle').textContent = authMode === 'login' ? 'Log In' : 'Sign Up';
+  document.getElementById('authSubmit').textContent = authMode === 'login' ? 'Log In' : 'Sign Up';
+  document.getElementById('authToggleText').textContent = authMode === 'login' ? "Don't have an account?" : 'Already have an account?';
+  document.getElementById('authToggleLink').textContent = authMode === 'login' ? 'Sign up' : 'Log in';
+  document.getElementById('authError').classList.remove('visible');
+  document.getElementById('authEmail').value = '';
+  document.getElementById('authPassword').value = '';
+  document.getElementById('authModalOverlay').classList.add('visible');
+  document.getElementById('authEmail').focus();
+}
+
+function closeAuthModal() {
+  document.getElementById('authModalOverlay').classList.remove('visible');
+}
+
+function toggleAuthMode() {
+  showAuthModal(authMode === 'login' ? 'signup' : 'login');
+}
+
+async function submitAuth() {
+  const email = document.getElementById('authEmail').value.trim();
+  const password = document.getElementById('authPassword').value;
+  const errEl = document.getElementById('authError');
+  const btn = document.getElementById('authSubmit');
+  errEl.classList.remove('visible');
+
+  if (!email || !password) {
+    errEl.textContent = 'Email and password required.';
+    errEl.classList.add('visible');
+    return;
+  }
+
+  btn.disabled = true;
+  btn.textContent = authMode === 'login' ? 'Logging in...' : 'Signing up...';
+
+  const endpoint = authMode === 'login' ? '/api/auth/login' : '/api/auth/signup';
+  try {
+    const resp = await fetch(endpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email, password }),
+    });
+    const data = await resp.json();
+
+    if (!resp.ok) {
+      errEl.textContent = data.error || 'Authentication failed.';
+      errEl.classList.add('visible');
+      return;
+    }
+
+    if (authMode === 'signup') {
+      showToast('Account created! Check your email to confirm.', 'success', 5000);
+      showAuthModal('login');
+      return;
+    }
+
+    // Login success
+    setAuthState({
+      accessToken: data.access_token,
+      refreshToken: data.refresh_token,
+      user: data.user,
+    });
+    closeAuthModal();
+    updateUserUI();
+    showToast('Welcome back, ' + data.user.email + '!', 'success');
+    loadLibrary();
+  } catch (e) {
+    errEl.textContent = 'Network error.';
+    errEl.classList.add('visible');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = authMode === 'login' ? 'Log In' : 'Sign Up';
+  }
+}
+
+function logout() {
+  setAuthState(null);
+  localStorage.removeItem('clipforge_library');
+  allClips = [];
+  applyLibraryView();
+  updateUserUI();
+  showToast('Logged out', 'info');
+}
+
+function updateUserUI() {
+  const area = document.getElementById('userArea');
+  const state = getAuthState();
+  if (state?.user) {
+    area.innerHTML = '<div class="user-bar"><span class="user-email">' + escapeHtml(state.user.email) + '</span><button type="button" class="btn-logout" onclick="logout()">Log out</button></div>';
+  } else {
+    area.innerHTML = '<button type="button" class="btn-login-header" onclick="showAuthModal(\'login\')">Log in</button>';
+  }
+}
+
+// Handle Enter key in auth inputs
+document.getElementById('authPassword').addEventListener('keydown', e => {
+  if (e.key === 'Enter') submitAuth();
+});
+
+// ── Init ────────────────────────────────────
+updateUserUI();
 loadLibrary();
 </script>
 </body>
