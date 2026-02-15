@@ -83,7 +83,14 @@ def check_rate_limit(ip):
     return False
 
 
+_cleanup_counter = 0
+_CLEANUP_EVERY_N = 5  # only run cleanup every Nth request
+
 def cleanup_old_files(max_age_seconds=300):
+    global _cleanup_counter
+    _cleanup_counter += 1
+    if _cleanup_counter % _CLEANUP_EVERY_N != 0:
+        return
     now = time.time()
     if TEMP_DIR.exists():
         for item in TEMP_DIR.iterdir():
@@ -152,9 +159,9 @@ def extract_video_id(url):
 
 
 def time_to_seconds(time_str):
-    """Safely parse MM:SS or HH:MM:SS, clamped to sane limits."""
+    """Safely parse MM:SS or HH:MM:SS, clamped to sane limits. Returns None for invalid input."""
     if not isinstance(time_str, str) or not re.match(r'^\d{1,2}(:\d{1,2}){1,2}$', time_str.strip()):
-        return 0
+        return None
     parts = time_str.strip().split(":")
     parts = [int(p) for p in parts]
     if len(parts) == 2:
@@ -162,7 +169,7 @@ def time_to_seconds(time_str):
     elif len(parts) == 3:
         secs = parts[0] * 3600 + parts[1] * 60 + parts[2]
     else:
-        return 0
+        return None
     return max(0, min(secs, 36000))  # clamp to 10 hours max
 
 
@@ -285,7 +292,7 @@ def download_full():
     if err:
         return jsonify({"error": err}), 400
 
-    job_id = str(uuid.uuid4())[:12]
+    job_id = uuid.uuid4().hex[:12]
     job_dir = TEMP_DIR / job_id
     job_dir.mkdir(exist_ok=True)
 
@@ -351,6 +358,10 @@ def trim_video():
 
     start_sec = time_to_seconds(start_time)
     end_sec = time_to_seconds(end_time)
+
+    if start_sec is None or end_sec is None:
+        return jsonify({"error": "Invalid time format. Use MM:SS or HH:MM:SS."}), 400
+
     duration = end_sec - start_sec
 
     if duration <= 0:
@@ -359,7 +370,7 @@ def trim_video():
     if duration > 600:
         return jsonify({"error": "Clips are limited to 10 minutes max."}), 400
 
-    job_id = str(uuid.uuid4())[:12]
+    job_id = uuid.uuid4().hex[:12]
     job_dir = TEMP_DIR / job_id
     job_dir.mkdir(exist_ok=True)
 
@@ -411,6 +422,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>ClipForge — Video Downloader & Trimmer</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>✂</text></svg>">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Outfit:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
 <style>
@@ -1116,12 +1128,12 @@ body::after {
 
   <!-- URL Input -->
   <div class="panel">
-    <div class="panel-label"><span class="dot"></span> Source</div>
+    <label class="panel-label" for="urlInput"><span class="dot"></span> Source</label>
     <div class="url-group">
       <input type="text" class="url-input" id="urlInput"
              placeholder="Paste a YouTube, Twitter, Instagram, or TikTok URL..."
              spellcheck="false" autocomplete="off">
-      <button class="btn-load" id="btnLoad" onclick="loadVideo()">Load</button>
+      <button type="button" class="btn-load" id="btnLoad" onclick="loadVideo()">Load</button>
     </div>
     <div class="error-msg" id="urlError"></div>
   </div>
@@ -1147,8 +1159,8 @@ body::after {
 
   <!-- Mode Toggle -->
   <div class="mode-toggle" id="modeToggle">
-    <button class="mode-btn active" id="modeDownload" onclick="setMode('download')">Download Full</button>
-    <button class="mode-btn" id="modeTrim" onclick="setMode('trim')">Trim & Download</button>
+    <button type="button" class="mode-btn active" id="modeDownload" onclick="setMode('download')">Download Full</button>
+    <button type="button" class="mode-btn" id="modeTrim" onclick="setMode('trim')">Trim & Download</button>
   </div>
 
   <!-- Timeline (trim mode) -->
@@ -1156,19 +1168,19 @@ body::after {
     <div class="panel-label"><span class="dot"></span> Trim Range</div>
     <div class="time-controls">
       <div class="time-field">
-        <label>Start Time</label>
+        <label for="startInput">Start Time</label>
         <input type="text" id="startInput" value="0:00" placeholder="0:00">
       </div>
       <div class="time-field">
-        <label>End Time</label>
+        <label for="endInput">End Time</label>
         <input type="text" id="endInput" value="0:00" placeholder="0:00">
       </div>
     </div>
     <div class="timeline-track" id="timelineTrack">
       <div class="timeline-waveform" id="waveform"></div>
       <div class="timeline-region" id="timelineRegion"></div>
-      <div class="timeline-handle" id="handleStart" style="left: 0%"></div>
-      <div class="timeline-handle" id="handleEnd" style="left: 100%"></div>
+      <div class="timeline-handle" id="handleStart" style="left: 0%" tabindex="0" role="slider" aria-label="Trim start" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"></div>
+      <div class="timeline-handle" id="handleEnd" style="left: 100%" tabindex="0" role="slider" aria-label="Trim end" aria-valuemin="0" aria-valuemax="100" aria-valuenow="100"></div>
     </div>
     <div class="timeline-labels">
       <span>0:00</span>
@@ -1179,7 +1191,7 @@ body::after {
 
   <!-- Action Button -->
   <div class="action-section" id="actionSection">
-    <button class="btn-action" id="btnAction" onclick="startAction()">
+    <button type="button" class="btn-action" id="btnAction" onclick="startAction()">
       Download Video
     </button>
     <div class="limit-note" id="limitNote"></div>
@@ -1210,7 +1222,7 @@ body::after {
     <p style="color:var(--text-secondary);font-size:0.85rem;margin-bottom:0.5rem" id="downloadInfo"></p>
     <a class="btn-download" id="btnDownload" href="#">Download MP4</a>
     <br>
-    <button class="reset-link" onclick="resetAll()">Download another video</button>
+    <button type="button" class="reset-link" onclick="resetAll()">Download another video</button>
   </div>
 
 </div>
@@ -1303,6 +1315,7 @@ async function loadVideo() {
 
     // Video meta
     document.getElementById('videoThumb').src = data.thumbnail || '';
+    document.getElementById('videoThumb').alt = 'Thumbnail for ' + (data.title || 'video');
     document.getElementById('videoTitle').textContent = data.title || 'Untitled';
     document.getElementById('videoChannel').textContent = data.channel || '';
     document.getElementById('videoDuration').textContent = videoDuration ? formatTime(videoDuration) : 'N/A';
@@ -1431,9 +1444,30 @@ function handleMove(clientX) {
 }
 
 document.addEventListener('mousemove', e => handleMove(e.clientX));
-document.addEventListener('touchmove', e => handleMove(e.touches[0].clientX));
+document.addEventListener('touchmove', e => handleMove(e.touches[0].clientX), { passive: true });
 document.addEventListener('mouseup', () => { dragging = null; });
 document.addEventListener('touchend', () => { dragging = null; });
+// Keyboard support for timeline handles
+['handleStart', 'handleEnd'].forEach(id => {
+  document.getElementById(id).addEventListener('keydown', e => {
+    if (!videoDuration) return;
+    const step = e.shiftKey ? 10 : 1;  // hold Shift for 10s steps
+    const inputId = id === 'handleStart' ? 'startInput' : 'endInput';
+    let sec = parseTime(document.getElementById(inputId).value);
+    if (e.key === 'ArrowRight' || e.key === 'ArrowUp') {
+      e.preventDefault();
+      sec = Math.min(sec + step, videoDuration);
+      document.getElementById(inputId).value = formatTime(sec);
+      updateTimeline();
+    } else if (e.key === 'ArrowLeft' || e.key === 'ArrowDown') {
+      e.preventDefault();
+      sec = Math.max(sec - step, 0);
+      document.getElementById(inputId).value = formatTime(sec);
+      updateTimeline();
+    }
+  });
+});
+
 document.getElementById('startInput').addEventListener('input', updateTimeline);
 document.getElementById('endInput').addEventListener('input', updateTimeline);
 
@@ -1492,13 +1526,29 @@ async function startAction() {
     }
 
     const blob = await resp.blob();
+
+    // Revoke previous blob URL if any
+    const dlBtn = document.getElementById('btnDownload');
+    if (dlBtn.href && dlBtn.href.startsWith('blob:')) {
+      URL.revokeObjectURL(dlBtn.href);
+    }
+
     const downloadUrl = URL.createObjectURL(blob);
+
+    // Detect file extension from Content-Disposition or fallback to .mp4
+    let fileExt = '.mp4';
+    const disposition = resp.headers.get('Content-Disposition');
+    if (disposition) {
+      const match = disposition.match(/filename="?[^"]*(\.\w+)"?/);
+      if (match) fileExt = match[1];
+    }
 
     document.getElementById('progressSection').classList.remove('visible');
     document.getElementById('downloadInfo').textContent = infoText;
-    document.getElementById('btnDownload').href = downloadUrl;
-    document.getElementById('btnDownload').setAttribute('download',
-      `${currentPlatform}_${videoId || 'video'}.mp4`);
+    dlBtn.href = downloadUrl;
+    dlBtn.setAttribute('download',
+      `${currentPlatform}_${videoId || 'video'}${fileExt}`);
+    dlBtn.textContent = `Download ${fileExt.replace('.', '').toUpperCase()}`;
     document.getElementById('downloadSection').classList.add('visible');
 
   } catch (e) {
@@ -1514,6 +1564,14 @@ function restoreAction() {
 }
 
 function resetAll() {
+  // Revoke blob URL to free memory
+  const dlBtn = document.getElementById('btnDownload');
+  if (dlBtn.href && dlBtn.href.startsWith('blob:')) {
+    URL.revokeObjectURL(dlBtn.href);
+  }
+  dlBtn.href = '#';
+  dlBtn.textContent = 'Download MP4';
+
   ['previewSection','timelineSection','actionSection','progressSection','downloadSection'].forEach(id =>
     document.getElementById(id).classList.remove('visible'));
   document.getElementById('modeToggle').classList.remove('visible');
@@ -1529,13 +1587,16 @@ function resetAll() {
 // ── Utilities ───────────────────────────────
 function formatTime(sec) {
   sec = Math.max(0, Math.round(sec));
-  const m = Math.floor(sec / 60);
+  const h = Math.floor(sec / 3600);
+  const m = Math.floor((sec % 3600) / 60);
   const s = sec % 60;
+  if (h > 0) return h + ':' + String(m).padStart(2, '0') + ':' + String(s).padStart(2, '0');
   return m + ':' + String(s).padStart(2, '0');
 }
 
 function parseTime(str) {
   const parts = str.split(':').map(Number);
+  if (parts.some(isNaN)) return 0;
   if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + (parts[2] || 0);
   if (parts.length === 2) return parts[0] * 60 + (parts[1] || 0);
   return 0;
