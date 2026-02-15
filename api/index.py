@@ -456,6 +456,8 @@ def upload_to_library(file_path, metadata):
             "file_path": storage_name,
             "file_size": file_path.stat().st_size,
             "file_ext": ext,
+            "tags": metadata.get("tags"),
+            "is_favorite": False,
         }
 
         result = sb.table("clips").insert(row).execute()
@@ -486,6 +488,7 @@ def save_to_library():
     thumbnail = data.get("thumbnail", "")
     channel = data.get("channel", "")
     vid_duration = data.get("duration", 0)
+    tags = data.get("tags")  # comma-separated string or None
 
     platform, err = validate_url(url)
     if err:
@@ -551,6 +554,7 @@ def save_to_library():
             "trim_start": data.get("start") if mode == "trim" else None,
             "trim_end": data.get("end") if mode == "trim" else None,
             "mode": mode,
+            "tags": tags,
         })
 
         cleanup_job_dir(job_dir)
@@ -615,6 +619,66 @@ def delete_clip(clip_id):
         return jsonify({"success": True})
     except Exception:
         return jsonify({"error": "Could not delete clip."}), 500
+
+
+# ── API: Toggle favorite ──────────────────────────────────────────────────────
+
+@app.route("/api/library/<clip_id>/favorite", methods=["PATCH"])
+def toggle_favorite(clip_id):
+    """Toggle the is_favorite flag on a clip."""
+    if not re.match(r'^[a-f0-9-]{36}$', clip_id):
+        return jsonify({"error": "Invalid clip ID."}), 400
+
+    try:
+        result = sb.table("clips").select("is_favorite").eq("id", clip_id).execute()
+        if not result.data:
+            return jsonify({"error": "Clip not found."}), 404
+
+        current = result.data[0].get("is_favorite", False)
+        sb.table("clips").update({"is_favorite": not current}).eq("id", clip_id).execute()
+        return jsonify({"success": True, "is_favorite": not current})
+    except Exception:
+        return jsonify({"error": "Could not update favorite."}), 500
+
+
+# ── API: Bulk delete ──────────────────────────────────────────────────────────
+
+@app.route("/api/library/bulk-delete", methods=["POST"])
+def bulk_delete():
+    """Delete multiple clips from storage and database."""
+    data = request.get_json(silent=True)
+    if not data or not isinstance(data.get("ids"), list):
+        return jsonify({"error": "Invalid request. Provide {\"ids\": [...]}"}), 400
+
+    ids = data["ids"]
+    if len(ids) > 50:
+        return jsonify({"error": "Too many IDs (max 50)."}), 400
+
+    # Validate all IDs
+    for cid in ids:
+        if not re.match(r'^[a-f0-9-]{36}$', cid):
+            return jsonify({"error": f"Invalid clip ID: {cid}"}), 400
+
+    deleted = 0
+    try:
+        # Get file paths for storage cleanup
+        result = sb.table("clips").select("id, file_path").in_("id", ids).execute()
+        if result.data:
+            file_paths = [r["file_path"] for r in result.data if r.get("file_path")]
+            # Delete from storage
+            if file_paths:
+                try:
+                    sb.storage.from_("clips").remove(file_paths)
+                except Exception:
+                    pass  # Some files may already be gone
+
+            # Delete from database
+            sb.table("clips").delete().in_("id", ids).execute()
+            deleted = len(result.data)
+
+        return jsonify({"success": True, "deleted": deleted})
+    except Exception:
+        return jsonify({"error": "Could not delete clips."}), 500
 
 
 # ── Frontend HTML ────────────────────────────────────────────────────────────
@@ -688,10 +752,32 @@ body::after {
 .app-container {
   position: relative;
   z-index: 1;
-  max-width: 900px;
+  max-width: 1440px;
   margin: 0 auto;
   padding: 2rem 1.5rem 4rem;
 }
+
+.app-columns {
+  display: grid;
+  grid-template-columns: 57% 43%;
+  gap: 1.5rem;
+  align-items: start;
+}
+
+.col-editor { min-width: 0; }
+
+.col-library {
+  position: sticky;
+  top: 1.5rem;
+  max-height: calc(100vh - 3rem);
+  overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-light) transparent;
+}
+.col-library::-webkit-scrollbar { width: 6px; }
+.col-library::-webkit-scrollbar-track { background: transparent; }
+.col-library::-webkit-scrollbar-thumb { background: var(--border-light); border-radius: 3px; }
+.col-library::-webkit-scrollbar-thumb:hover { background: var(--text-muted); }
 
 /* ── Header ─────────────────────────────────────── */
 .header {
@@ -1308,12 +1394,216 @@ body::after {
   pointer-events: none;
 }
 
+/* ── Save Dialog ──────────────────────────────── */
+.save-dialog {
+  display: none;
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 1.25rem;
+  margin-top: 1rem;
+  animation: fadeSlideIn 0.3s ease-out;
+}
+.save-dialog.visible { display: block; }
+
+.save-dialog label {
+  display: block;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.6rem;
+  letter-spacing: 2px;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  margin-bottom: 0.4rem;
+}
+
+.save-dialog input[type="text"] {
+  width: 100%;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.65rem 0.9rem;
+  color: var(--text-primary);
+  font-family: 'Outfit', sans-serif;
+  font-size: 0.85rem;
+  outline: none;
+  transition: border-color 0.3s;
+  margin-bottom: 1rem;
+}
+.save-dialog input[type="text"]:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-dim);
+}
+
+.tag-input-wrap {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.5rem 0.7rem;
+  margin-bottom: 1rem;
+  min-height: 40px;
+  cursor: text;
+  transition: border-color 0.3s;
+}
+.tag-input-wrap:focus-within {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-dim);
+}
+
+.tag-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  background: var(--accent-dim);
+  color: var(--accent);
+  border: 1px solid var(--accent);
+  border-radius: 20px;
+  padding: 0.2rem 0.6rem;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.65rem;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.tag-chip .tag-remove {
+  cursor: pointer;
+  opacity: 0.6;
+  font-size: 0.8rem;
+  line-height: 1;
+}
+.tag-chip .tag-remove:hover { opacity: 1; }
+
+.tag-input-field {
+  flex: 1;
+  min-width: 80px;
+  background: transparent;
+  border: none;
+  color: var(--text-primary);
+  font-family: 'Outfit', sans-serif;
+  font-size: 0.8rem;
+  outline: none;
+}
+.tag-input-field::placeholder { color: var(--text-muted); }
+
+.save-dialog-actions {
+  display: flex;
+  gap: 0.5rem;
+}
+
+.btn-confirm-save {
+  flex: 1;
+  padding: 0.75rem;
+  background: linear-gradient(135deg, var(--accent) 0%, #00c98a 100%);
+  color: var(--bg-deep);
+  border: none;
+  border-radius: 8px;
+  font-family: 'Outfit', sans-serif;
+  font-size: 0.85rem;
+  font-weight: 700;
+  cursor: pointer;
+  transition: all 0.25s;
+}
+.btn-confirm-save:hover { transform: translateY(-1px); box-shadow: 0 4px 16px var(--accent-glow); }
+.btn-confirm-save:disabled { opacity: 0.4; cursor: not-allowed; transform: none; }
+
+.btn-cancel-save {
+  padding: 0.75rem 1.2rem;
+  background: var(--bg-elevated);
+  color: var(--text-secondary);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-family: 'Outfit', sans-serif;
+  font-size: 0.85rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+.btn-cancel-save:hover { border-color: var(--border-light); color: var(--text-primary); }
+
 /* ── Library ───────────────────────────────────── */
 .library-section {
-  margin-top: 2rem;
   animation: fadeSlideIn 0.8s ease-out backwards;
   animation-delay: 0.2s;
 }
+
+/* ── Library Toolbar ──────────────────────────── */
+.library-toolbar {
+  margin-bottom: 1rem;
+}
+
+.library-search {
+  width: 100%;
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.6rem 0.9rem;
+  color: var(--text-primary);
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.75rem;
+  outline: none;
+  transition: border-color 0.3s;
+  margin-bottom: 0.75rem;
+}
+.library-search::placeholder { color: var(--text-muted); }
+.library-search:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-dim); }
+
+.library-filters {
+  display: flex;
+  gap: 0.35rem;
+  flex-wrap: wrap;
+  margin-bottom: 0.75rem;
+}
+
+.filter-pill {
+  padding: 0.3rem 0.7rem;
+  border-radius: 20px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.6rem;
+  font-weight: 600;
+  letter-spacing: 0.3px;
+  border: 1px solid var(--border);
+  background: var(--bg-surface);
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: all 0.2s;
+}
+.filter-pill:hover { border-color: var(--border-light); color: var(--text-secondary); }
+.filter-pill.active { border-color: var(--accent); background: var(--accent-dim); color: var(--accent); }
+
+.library-sort-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 0.75rem;
+}
+
+.library-sort {
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.35rem 0.6rem;
+  color: var(--text-secondary);
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.6rem;
+  outline: none;
+  cursor: pointer;
+}
+.library-sort option { background: var(--bg-panel); }
+
+.btn-select-all {
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.35rem 0.7rem;
+  color: var(--text-muted);
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.6rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+.btn-select-all:hover { border-color: var(--border-light); color: var(--text-secondary); }
 
 .library-stats {
   font-family: 'JetBrains Mono', monospace;
@@ -1324,8 +1614,8 @@ body::after {
 
 .library-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
-  gap: 1rem;
+  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  gap: 0.75rem;
 }
 
 .library-empty {
@@ -1336,7 +1626,9 @@ body::after {
   font-size: 0.9rem;
 }
 
+/* ── Clip Card ─────────────────────────────────── */
 .clip-card {
+  position: relative;
   background: var(--bg-surface);
   border: 1px solid var(--border);
   border-radius: 12px;
@@ -1349,6 +1641,7 @@ body::after {
   transform: translateY(-2px);
   box-shadow: 0 8px 24px rgba(0,0,0,0.3);
 }
+.clip-card.selected { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-dim); }
 
 .clip-card-thumb {
   position: relative;
@@ -1392,37 +1685,113 @@ body::after {
   color: var(--text-secondary);
 }
 
+/* Checkbox overlay */
+.clip-checkbox {
+  position: absolute;
+  top: 8px;
+  left: 8px;
+  width: 22px;
+  height: 22px;
+  border-radius: 6px;
+  border: 2px solid rgba(255,255,255,0.5);
+  background: rgba(0,0,0,0.5);
+  cursor: pointer;
+  z-index: 3;
+  opacity: 0;
+  transition: opacity 0.2s;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.clip-card:hover .clip-checkbox,
+.clip-card.selected .clip-checkbox,
+.bulk-mode .clip-checkbox { opacity: 1; }
+.clip-checkbox.checked {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+.clip-checkbox.checked::after {
+  content: '';
+  width: 6px;
+  height: 10px;
+  border: solid var(--bg-deep);
+  border-width: 0 2px 2px 0;
+  transform: rotate(45deg) translate(-1px, -1px);
+}
+
+/* Favorite star */
+.clip-favorite {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  background: rgba(0,0,0,0.5);
+  border: none;
+  cursor: pointer;
+  z-index: 3;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.85rem;
+  transition: all 0.2s;
+  opacity: 0;
+  color: var(--text-muted);
+}
+.clip-card:hover .clip-favorite { opacity: 1; }
+.clip-favorite.active { opacity: 1; color: #ffd700; }
+.clip-favorite:hover { transform: scale(1.15); }
+
 .clip-card-body {
   padding: 0.85rem;
 }
 .clip-card-body h4 {
-  font-size: 0.85rem;
+  font-size: 0.8rem;
   font-weight: 600;
   line-height: 1.3;
-  margin-bottom: 0.35rem;
+  margin-bottom: 0.3rem;
   overflow: hidden;
   text-overflow: ellipsis;
   display: -webkit-box;
   -webkit-line-clamp: 2;
   -webkit-box-orient: vertical;
 }
+
+.clip-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem;
+  margin-bottom: 0.35rem;
+}
+.clip-tags .clip-tag {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.5rem;
+  font-weight: 600;
+  padding: 0.1rem 0.4rem;
+  border-radius: 10px;
+  background: var(--bg-elevated);
+  color: var(--text-secondary);
+  border: 1px solid var(--border);
+}
+
 .clip-card-body .clip-meta {
   font-family: 'JetBrains Mono', monospace;
   font-size: 0.6rem;
   color: var(--text-muted);
-  margin-bottom: 0.6rem;
+  margin-bottom: 0.5rem;
 }
 
 .clip-card-actions {
   display: flex;
-  gap: 0.5rem;
+  gap: 0.4rem;
 }
 .clip-card-actions a, .clip-card-actions button {
   flex: 1;
-  padding: 0.45rem;
+  padding: 0.4rem;
   border-radius: 6px;
   font-family: 'JetBrains Mono', monospace;
-  font-size: 0.65rem;
+  font-size: 0.6rem;
   font-weight: 600;
   text-align: center;
   cursor: pointer;
@@ -1443,6 +1812,56 @@ body::after {
 }
 .clip-btn-del:hover { border-color: var(--danger); color: var(--danger); }
 
+/* ── Bulk Action Bar ──────────────────────────── */
+.bulk-bar {
+  display: none;
+  position: sticky;
+  bottom: 0;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 0.75rem 1rem;
+  margin-top: 0.75rem;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  animation: fadeSlideIn 0.3s ease-out;
+  z-index: 10;
+}
+.bulk-bar.visible { display: flex; }
+
+.bulk-bar-info {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.7rem;
+  color: var(--text-secondary);
+  font-weight: 600;
+}
+
+.bulk-bar-actions { display: flex; gap: 0.5rem; }
+
+.bulk-btn {
+  padding: 0.45rem 0.9rem;
+  border-radius: 6px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.65rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s;
+  border: 1px solid;
+}
+.bulk-btn-download {
+  background: var(--accent-dim);
+  color: var(--accent);
+  border-color: var(--accent);
+}
+.bulk-btn-download:hover { background: var(--accent); color: var(--bg-deep); }
+.bulk-btn-delete {
+  background: transparent;
+  color: var(--danger);
+  border-color: var(--danger);
+}
+.bulk-btn-delete:hover { background: #ff406020; }
+
 /* ── Animations ─────────────────────────────────── */
 @keyframes fadeSlideIn {
   from { opacity: 0; transform: translateY(12px); }
@@ -1456,13 +1875,10 @@ body::after {
 
 @keyframes spin { to { transform: rotate(360deg); } }
 
-/* ── Responsive ─────────────────────────────────── */
-@media (max-width: 600px) {
-  .app-container { padding: 1.25rem 1rem 3rem; }
-  .header h1 { font-size: 1.8rem; }
-  .url-group { flex-direction: column; }
-  .video-meta { flex-direction: column; }
-  .video-thumb { width: 100%; }
+/* ── Responsive (keep minimal) ──────────────────── */
+@media (max-width: 900px) {
+  .app-columns { grid-template-columns: 1fr; }
+  .col-library { position: static; max-height: none; }
 }
 </style>
 </head>
@@ -1495,121 +1911,177 @@ body::after {
     </div>
   </header>
 
-  <!-- URL Input -->
-  <div class="panel">
-    <label class="panel-label" for="urlInput"><span class="dot"></span> Source</label>
-    <div class="url-group">
-      <input type="text" class="url-input" id="urlInput"
-             placeholder="Paste a YouTube, Twitter, Instagram, or TikTok URL..."
-             spellcheck="false" autocomplete="off">
-      <button type="button" class="btn-load" id="btnLoad" onclick="loadVideo()">Load</button>
-    </div>
-    <div class="error-msg" id="urlError"></div>
-  </div>
+  <div class="app-columns">
 
-  <!-- Video Preview -->
-  <div class="panel preview-section" id="previewSection">
-    <div class="panel-label"><span class="dot"></span> Preview</div>
+    <!-- ═══ LEFT COLUMN: Editor ═══ -->
+    <div class="col-editor">
 
-    <div class="platform-badge" id="platformBadge"></div>
-
-    <div class="video-meta">
-      <img class="video-thumb" id="videoThumb" src="" alt="">
-      <div class="video-info">
-        <h3 id="videoTitle"></h3>
-        <div class="channel" id="videoChannel"></div>
-        <div class="duration-badge" id="videoDuration"></div>
+      <!-- URL Input -->
+      <div class="panel">
+        <label class="panel-label" for="urlInput"><span class="dot"></span> Source</label>
+        <div class="url-group">
+          <input type="text" class="url-input" id="urlInput"
+                 placeholder="Paste a YouTube, Twitter, Instagram, or TikTok URL..."
+                 spellcheck="false" autocomplete="off">
+          <button type="button" class="btn-load" id="btnLoad" onclick="loadVideo()">Load</button>
+        </div>
+        <div class="error-msg" id="urlError"></div>
       </div>
-    </div>
-    <div class="player-wrap" id="playerWrap">
-      <iframe id="ytPlayer" src="" allow="autoplay; encrypted-media" allowfullscreen sandbox="allow-scripts allow-same-origin allow-popups"></iframe>
-    </div>
-  </div>
 
-  <!-- Mode Toggle -->
-  <div class="mode-toggle" id="modeToggle">
-    <button type="button" class="mode-btn active" id="modeDownload" onclick="setMode('download')">Download Full</button>
-    <button type="button" class="mode-btn" id="modeTrim" onclick="setMode('trim')">Trim & Download</button>
-  </div>
-
-  <!-- Timeline (trim mode) -->
-  <div class="panel timeline-section" id="timelineSection">
-    <div class="panel-label"><span class="dot"></span> Trim Range</div>
-    <div class="time-controls">
-      <div class="time-field">
-        <label for="startInput">Start Time</label>
-        <input type="text" id="startInput" value="0:00" placeholder="0:00">
+      <!-- Video Preview -->
+      <div class="panel preview-section" id="previewSection">
+        <div class="panel-label"><span class="dot"></span> Preview</div>
+        <div class="platform-badge" id="platformBadge"></div>
+        <div class="video-meta">
+          <img class="video-thumb" id="videoThumb" src="" alt="">
+          <div class="video-info">
+            <h3 id="videoTitle"></h3>
+            <div class="channel" id="videoChannel"></div>
+            <div class="duration-badge" id="videoDuration"></div>
+          </div>
+        </div>
+        <div class="player-wrap" id="playerWrap">
+          <iframe id="ytPlayer" src="" allow="autoplay; encrypted-media" allowfullscreen sandbox="allow-scripts allow-same-origin allow-popups"></iframe>
+        </div>
       </div>
-      <div class="time-field">
-        <label for="endInput">End Time</label>
-        <input type="text" id="endInput" value="0:00" placeholder="0:00">
+
+      <!-- Mode Toggle -->
+      <div class="mode-toggle" id="modeToggle">
+        <button type="button" class="mode-btn active" id="modeDownload" onclick="setMode('download')">Download Full</button>
+        <button type="button" class="mode-btn" id="modeTrim" onclick="setMode('trim')">Trim & Download</button>
       </div>
-    </div>
-    <div class="timeline-track" id="timelineTrack">
-      <div class="timeline-waveform" id="waveform"></div>
-      <div class="timeline-region" id="timelineRegion"></div>
-      <div class="timeline-handle" id="handleStart" style="left: 0%" tabindex="0" role="slider" aria-label="Trim start" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"></div>
-      <div class="timeline-handle" id="handleEnd" style="left: 100%" tabindex="0" role="slider" aria-label="Trim end" aria-valuemin="0" aria-valuemax="100" aria-valuenow="100"></div>
-    </div>
-    <div class="timeline-labels">
-      <span>0:00</span>
-      <span id="totalDurationLabel">0:00</span>
-    </div>
-    <div class="clip-duration">Clip length: <span id="clipDuration">0:00</span></div>
-  </div>
 
-  <!-- Action Button -->
-  <div class="action-section" id="actionSection">
-    <button type="button" class="btn-action" id="btnAction" onclick="startAction()">
-      Download Video
-    </button>
-    <div class="limit-note" id="limitNote"></div>
-    <div class="error-msg" id="trimError"></div>
-  </div>
-
-  <!-- Progress -->
-  <div class="panel progress-section" id="progressSection">
-    <div class="panel-label"><span class="dot"></span> Processing</div>
-    <div class="progress-bar-track">
-      <div class="progress-bar-fill" id="progressFill"></div>
-    </div>
-    <div class="progress-status" id="progressStatus">
-      <span class="spinner"></span> Downloading video...
-    </div>
-  </div>
-
-  <!-- Download -->
-  <div class="panel download-section" id="downloadSection">
-    <div class="download-icon">
-      <svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
-        <polyline points="7 10 12 15 17 10"/>
-        <line x1="12" y1="15" x2="12" y2="3"/>
-      </svg>
-    </div>
-    <div class="success-text">Your video is ready!</div>
-    <p style="color:var(--text-secondary);font-size:0.85rem;margin-bottom:0.5rem" id="downloadInfo"></p>
-    <a class="btn-download" id="btnDownload" href="#">Download MP4</a>
-    <br>
-    <button type="button" class="btn-save-library" id="btnSaveLibrary" onclick="saveToLibrary()">Save to Library</button>
-    <br>
-    <button type="button" class="reset-link" onclick="resetAll()">Download another video</button>
-  </div>
-
-  <!-- Library -->
-  <div class="panel library-section" id="librarySection">
-    <div class="panel-label"><span class="dot"></span> My Library</div>
-    <div class="library-stats" id="libraryStats"></div>
-    <div class="library-grid" id="libraryGrid">
-      <div class="library-empty" id="libraryEmpty">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" style="width:40px;height:40px;color:var(--text-muted);margin-bottom:0.75rem">
-          <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>
-        </svg>
-        <p>No saved clips yet</p>
-        <p style="font-size:0.75rem;color:var(--text-muted)">Download or trim a video and save it to your library</p>
+      <!-- Timeline (trim mode) -->
+      <div class="panel timeline-section" id="timelineSection">
+        <div class="panel-label"><span class="dot"></span> Trim Range</div>
+        <div class="time-controls">
+          <div class="time-field">
+            <label for="startInput">Start Time</label>
+            <input type="text" id="startInput" value="0:00" placeholder="0:00">
+          </div>
+          <div class="time-field">
+            <label for="endInput">End Time</label>
+            <input type="text" id="endInput" value="0:00" placeholder="0:00">
+          </div>
+        </div>
+        <div class="timeline-track" id="timelineTrack">
+          <div class="timeline-waveform" id="waveform"></div>
+          <div class="timeline-region" id="timelineRegion"></div>
+          <div class="timeline-handle" id="handleStart" style="left: 0%" tabindex="0" role="slider" aria-label="Trim start" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"></div>
+          <div class="timeline-handle" id="handleEnd" style="left: 100%" tabindex="0" role="slider" aria-label="Trim end" aria-valuemin="0" aria-valuemax="100" aria-valuenow="100"></div>
+        </div>
+        <div class="timeline-labels">
+          <span>0:00</span>
+          <span id="totalDurationLabel">0:00</span>
+        </div>
+        <div class="clip-duration">Clip length: <span id="clipDuration">0:00</span></div>
       </div>
-    </div>
-  </div>
+
+      <!-- Action Button -->
+      <div class="action-section" id="actionSection">
+        <button type="button" class="btn-action" id="btnAction" onclick="startAction()">
+          Download Video
+        </button>
+        <div class="limit-note" id="limitNote"></div>
+        <div class="error-msg" id="trimError"></div>
+      </div>
+
+      <!-- Progress -->
+      <div class="panel progress-section" id="progressSection">
+        <div class="panel-label"><span class="dot"></span> Processing</div>
+        <div class="progress-bar-track">
+          <div class="progress-bar-fill" id="progressFill"></div>
+        </div>
+        <div class="progress-status" id="progressStatus">
+          <span class="spinner"></span> Downloading video...
+        </div>
+      </div>
+
+      <!-- Download + Save Dialog -->
+      <div class="panel download-section" id="downloadSection">
+        <div class="download-icon">
+          <svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+            <polyline points="7 10 12 15 17 10"/>
+            <line x1="12" y1="15" x2="12" y2="3"/>
+          </svg>
+        </div>
+        <div class="success-text">Your video is ready!</div>
+        <p style="color:var(--text-secondary);font-size:0.85rem;margin-bottom:0.5rem" id="downloadInfo"></p>
+        <a class="btn-download" id="btnDownload" href="#">Download MP4</a>
+        <br>
+        <button type="button" class="btn-save-library" id="btnSaveLibrary" onclick="openSaveDialog()">Save to Library</button>
+
+        <!-- Save Dialog -->
+        <div class="save-dialog" id="saveDialog">
+          <label for="saveTitleInput">Title</label>
+          <input type="text" id="saveTitleInput" placeholder="Clip title..." maxlength="200">
+
+          <label>Tags <span style="font-size:0.5rem;letter-spacing:0;text-transform:none;color:var(--text-muted)">(Enter to add, max 10)</span></label>
+          <div class="tag-input-wrap" id="tagInputWrap" onclick="document.getElementById('tagField').focus()">
+            <input type="text" class="tag-input-field" id="tagField" placeholder="Add a tag...">
+          </div>
+
+          <div class="save-dialog-actions">
+            <button type="button" class="btn-confirm-save" id="btnConfirmSave" onclick="saveToLibrary()">Confirm & Save</button>
+            <button type="button" class="btn-cancel-save" onclick="closeSaveDialog()">Cancel</button>
+          </div>
+        </div>
+
+        <br>
+        <button type="button" class="reset-link" onclick="resetAll()">Download another video</button>
+      </div>
+
+    </div><!-- /col-editor -->
+
+    <!-- ═══ RIGHT COLUMN: Library ═══ -->
+    <div class="col-library">
+      <div class="panel library-section" id="librarySection">
+        <div class="panel-label"><span class="dot"></span> My Library</div>
+
+        <div class="library-toolbar">
+          <input type="text" class="library-search" id="librarySearch" placeholder="Search clips by title or tag..." oninput="applyLibraryView()">
+          <div class="library-filters" id="libraryFilters">
+            <button type="button" class="filter-pill active" onclick="setFilter('all')">All</button>
+            <button type="button" class="filter-pill" onclick="setFilter('youtube')">YouTube</button>
+            <button type="button" class="filter-pill" onclick="setFilter('twitter')">Twitter</button>
+            <button type="button" class="filter-pill" onclick="setFilter('instagram')">Instagram</button>
+            <button type="button" class="filter-pill" onclick="setFilter('tiktok')">TikTok</button>
+          </div>
+          <div class="library-sort-row">
+            <select class="library-sort" id="librarySort" onchange="applyLibraryView()">
+              <option value="newest">Newest</option>
+              <option value="oldest">Oldest</option>
+              <option value="largest">Largest</option>
+              <option value="smallest">Smallest</option>
+            </select>
+            <button type="button" class="btn-select-all" id="btnSelectAll" onclick="toggleSelectAll()">Select All</button>
+          </div>
+        </div>
+
+        <div class="library-stats" id="libraryStats"></div>
+        <div class="library-grid" id="libraryGrid">
+          <div class="library-empty" id="libraryEmpty">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" style="width:40px;height:40px;color:var(--text-muted);margin-bottom:0.75rem">
+              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>
+            </svg>
+            <p>No saved clips yet</p>
+            <p style="font-size:0.75rem;color:var(--text-muted)">Download or trim a video and save it to your library</p>
+          </div>
+        </div>
+
+        <!-- Bulk Action Bar -->
+        <div class="bulk-bar" id="bulkBar">
+          <span class="bulk-bar-info" id="bulkBarInfo">0 selected</span>
+          <div class="bulk-bar-actions">
+            <button type="button" class="bulk-btn bulk-btn-download" onclick="bulkDownload()">Download</button>
+            <button type="button" class="bulk-btn bulk-btn-delete" onclick="bulkDelete()">Delete</button>
+          </div>
+        </div>
+      </div>
+    </div><!-- /col-library -->
+
+  </div><!-- /app-columns -->
 
 </div>
 
@@ -1619,6 +2091,12 @@ let videoId = '';
 let currentPlatform = '';
 let currentMode = 'download';
 let dragging = null;
+
+// Library state
+let allClips = [];
+let currentFilter = 'all';
+let selectedClipIds = new Set();
+let saveTags = [];
 
 const PLATFORM_LABELS = {
   youtube:   'YouTube',
@@ -1958,11 +2436,17 @@ function resetAll() {
   dlBtn.href = '#';
   dlBtn.textContent = 'Download MP4';
 
-  // Reset save button
+  // Reset save button + dialog
   const saveBtn = document.getElementById('btnSaveLibrary');
   saveBtn.disabled = false;
   saveBtn.textContent = 'Save to Library';
   saveBtn.classList.remove('saved');
+  saveBtn.style.display = '';
+  closeSaveDialog();
+  const confirmBtn = document.getElementById('btnConfirmSave');
+  confirmBtn.disabled = false;
+  confirmBtn.textContent = 'Confirm & Save';
+  saveTags = [];
 
   ['previewSection','timelineSection','actionSection','progressSection','downloadSection'].forEach(id =>
     document.getElementById(id).classList.remove('visible'));
@@ -2004,22 +2488,73 @@ document.getElementById('urlInput').addEventListener('keydown', e => {
   if (e.key === 'Enter') loadVideo();
 });
 
+// ── Save Dialog ─────────────────────────────
+
+function openSaveDialog() {
+  const dialog = document.getElementById('saveDialog');
+  const titleInput = document.getElementById('saveTitleInput');
+  titleInput.value = document.getElementById('videoTitle').textContent || '';
+  saveTags = [];
+  renderSaveTags();
+  dialog.classList.add('visible');
+  document.getElementById('btnSaveLibrary').style.display = 'none';
+  titleInput.focus();
+}
+
+function closeSaveDialog() {
+  document.getElementById('saveDialog').classList.remove('visible');
+  document.getElementById('btnSaveLibrary').style.display = '';
+}
+
+function renderSaveTags() {
+  const wrap = document.getElementById('tagInputWrap');
+  wrap.querySelectorAll('.tag-chip').forEach(el => el.remove());
+  const field = document.getElementById('tagField');
+  saveTags.forEach((tag, i) => {
+    const chip = document.createElement('span');
+    chip.className = 'tag-chip';
+    chip.innerHTML = escapeHtml(tag) + '<span class="tag-remove">&times;</span>';
+    chip.querySelector('.tag-remove').onclick = () => { saveTags.splice(i, 1); renderSaveTags(); };
+    wrap.insertBefore(chip, field);
+  });
+}
+
+document.getElementById('tagField').addEventListener('keydown', function(e) {
+  if ((e.key === 'Enter' || e.key === ',') && this.value.trim()) {
+    e.preventDefault();
+    const tag = this.value.trim().replace(/,/g, '').substring(0, 30);
+    if (tag && saveTags.length < 10 && !saveTags.includes(tag)) {
+      saveTags.push(tag);
+      renderSaveTags();
+    }
+    this.value = '';
+  }
+  if (e.key === 'Backspace' && !this.value && saveTags.length > 0) {
+    saveTags.pop();
+    renderSaveTags();
+  }
+});
+
 // ── Library ─────────────────────────────────
 
 async function saveToLibrary() {
-  const btn = document.getElementById('btnSaveLibrary');
+  const btn = document.getElementById('btnConfirmSave');
   btn.disabled = true;
   btn.textContent = 'Saving...';
 
   const url = document.getElementById('urlInput').value.trim();
+  const customTitle = document.getElementById('saveTitleInput').value.trim() || 'Untitled';
+  const tagsStr = saveTags.length > 0 ? saveTags.join(',') : null;
+
   const body = {
     url,
     mode: currentMode,
-    title: document.getElementById('videoTitle').textContent,
+    title: customTitle,
     platform: currentPlatform,
     thumbnail: document.getElementById('videoThumb').src,
     channel: document.getElementById('videoChannel').textContent,
     duration: videoDuration,
+    tags: tagsStr,
   };
 
   if (currentMode === 'trim') {
@@ -2038,17 +2573,20 @@ async function saveToLibrary() {
     if (!resp.ok) {
       btn.textContent = 'Save Failed';
       btn.disabled = false;
-      setTimeout(() => { btn.textContent = 'Save to Library'; }, 2000);
+      setTimeout(() => { btn.textContent = 'Confirm & Save'; }, 2000);
       return;
     }
 
-    btn.textContent = 'Saved!';
-    btn.classList.add('saved');
+    closeSaveDialog();
+    const saveBtn = document.getElementById('btnSaveLibrary');
+    saveBtn.textContent = 'Saved!';
+    saveBtn.classList.add('saved');
+    saveBtn.style.display = '';
     loadLibrary();
   } catch (e) {
     btn.textContent = 'Save Failed';
     btn.disabled = false;
-    setTimeout(() => { btn.textContent = 'Save to Library'; }, 2000);
+    setTimeout(() => { btn.textContent = 'Confirm & Save'; }, 2000);
   }
 }
 
@@ -2056,10 +2594,152 @@ async function loadLibrary() {
   try {
     const resp = await fetch('/api/library');
     const data = await resp.json();
-    renderLibrary(data.clips || []);
+    allClips = data.clips || [];
+    applyLibraryView();
   } catch (e) {
     // silently fail
   }
+}
+
+function applyLibraryView() {
+  const search = (document.getElementById('librarySearch').value || '').toLowerCase();
+  const sort = document.getElementById('librarySort').value;
+
+  let filtered = allClips.filter(c => {
+    // Platform filter
+    if (currentFilter !== 'all' && c.platform !== currentFilter) return false;
+    // Search filter
+    if (search) {
+      const title = (c.title || '').toLowerCase();
+      const tags = (c.tags || '').toLowerCase();
+      if (!title.includes(search) && !tags.includes(search)) return false;
+    }
+    return true;
+  });
+
+  // Sort
+  filtered.sort((a, b) => {
+    if (sort === 'newest') return new Date(b.created_at) - new Date(a.created_at);
+    if (sort === 'oldest') return new Date(a.created_at) - new Date(b.created_at);
+    if (sort === 'largest') return (b.file_size || 0) - (a.file_size || 0);
+    if (sort === 'smallest') return (a.file_size || 0) - (b.file_size || 0);
+    return 0;
+  });
+
+  // Pin favorites to top
+  const favs = filtered.filter(c => c.is_favorite);
+  const rest = filtered.filter(c => !c.is_favorite);
+  filtered = [...favs, ...rest];
+
+  renderLibrary(filtered);
+}
+
+function setFilter(platform) {
+  currentFilter = platform;
+  document.querySelectorAll('#libraryFilters .filter-pill').forEach(el => {
+    el.classList.toggle('active', el.textContent.trim().toLowerCase().replace(/ \/ .*/, '').replace('all', 'all') ===
+      (platform === 'all' ? 'all' : platform));
+  });
+  // Simpler: re-apply active by matching
+  const pills = document.querySelectorAll('#libraryFilters .filter-pill');
+  const labels = ['all', 'youtube', 'twitter', 'instagram', 'tiktok'];
+  pills.forEach((el, i) => el.classList.toggle('active', labels[i] === platform));
+  applyLibraryView();
+}
+
+async function toggleFavorite(clipId) {
+  try {
+    const resp = await fetch('/api/library/' + clipId + '/favorite', { method: 'PATCH' });
+    const data = await resp.json();
+    if (data.success) {
+      const clip = allClips.find(c => c.id === clipId);
+      if (clip) clip.is_favorite = data.is_favorite;
+      applyLibraryView();
+    }
+  } catch (e) { /* ignore */ }
+}
+
+function onClipSelectChange(clipId) {
+  if (selectedClipIds.has(clipId)) {
+    selectedClipIds.delete(clipId);
+  } else {
+    selectedClipIds.add(clipId);
+  }
+  updateBulkBar();
+  // Update card visual
+  document.querySelectorAll('.clip-card').forEach(card => {
+    const cb = card.querySelector('.clip-checkbox');
+    if (!cb) return;
+    const id = cb.dataset.clipId;
+    card.classList.toggle('selected', selectedClipIds.has(id));
+    cb.classList.toggle('checked', selectedClipIds.has(id));
+  });
+}
+
+function toggleSelectAll() {
+  const grid = document.getElementById('libraryGrid');
+  const visibleIds = [];
+  grid.querySelectorAll('.clip-checkbox').forEach(cb => visibleIds.push(cb.dataset.clipId));
+
+  const allSelected = visibleIds.length > 0 && visibleIds.every(id => selectedClipIds.has(id));
+  if (allSelected) {
+    visibleIds.forEach(id => selectedClipIds.delete(id));
+  } else {
+    visibleIds.forEach(id => selectedClipIds.add(id));
+  }
+  updateBulkBar();
+  // Update visuals
+  grid.querySelectorAll('.clip-card').forEach(card => {
+    const cb = card.querySelector('.clip-checkbox');
+    if (!cb) return;
+    const id = cb.dataset.clipId;
+    card.classList.toggle('selected', selectedClipIds.has(id));
+    cb.classList.toggle('checked', selectedClipIds.has(id));
+  });
+}
+
+function updateBulkBar() {
+  const bar = document.getElementById('bulkBar');
+  const info = document.getElementById('bulkBarInfo');
+  const container = document.getElementById('librarySection');
+  if (selectedClipIds.size > 0) {
+    bar.classList.add('visible');
+    container.classList.add('bulk-mode');
+    info.textContent = selectedClipIds.size + ' selected';
+  } else {
+    bar.classList.remove('visible');
+    container.classList.remove('bulk-mode');
+  }
+}
+
+async function bulkDelete() {
+  if (!confirm('Delete ' + selectedClipIds.size + ' clip(s) permanently?')) return;
+  try {
+    const resp = await fetch('/api/library/bulk-delete', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ids: Array.from(selectedClipIds) }),
+    });
+    if (resp.ok) {
+      selectedClipIds.clear();
+      updateBulkBar();
+      loadLibrary();
+    }
+  } catch (e) { /* ignore */ }
+}
+
+function bulkDownload() {
+  const clips = allClips.filter(c => selectedClipIds.has(c.id));
+  clips.forEach((clip, i) => {
+    setTimeout(() => {
+      const a = document.createElement('a');
+      a.href = clip.download_url;
+      a.download = (clip.title || 'clip') + (clip.file_ext || '.mp4');
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+    }, i * 500);
+  });
 }
 
 function renderLibrary(clips) {
@@ -2067,46 +2747,62 @@ function renderLibrary(clips) {
   const empty = document.getElementById('libraryEmpty');
   const stats = document.getElementById('libraryStats');
 
-  // Remove existing cards
   grid.querySelectorAll('.clip-card').forEach(el => el.remove());
 
   if (clips.length === 0) {
     empty.style.display = '';
-    stats.textContent = '';
+    stats.textContent = currentFilter !== 'all' || document.getElementById('librarySearch').value
+      ? 'No clips match your filters'
+      : '';
     return;
   }
 
   empty.style.display = 'none';
   const totalSize = clips.reduce((sum, c) => sum + (c.file_size || 0), 0);
-  stats.textContent = `${clips.length} clip${clips.length !== 1 ? 's' : ''} · ${formatFileSize(totalSize)}`;
+  stats.textContent = clips.length + ' clip' + (clips.length !== 1 ? 's' : '') + ' \u00b7 ' + formatFileSize(totalSize);
 
   clips.forEach((clip, i) => {
     const card = document.createElement('div');
-    card.className = 'clip-card';
-    card.style.animationDelay = (i * 0.05) + 's';
+    card.className = 'clip-card' + (selectedClipIds.has(clip.id) ? ' selected' : '');
+    card.style.animationDelay = (i * 0.03) + 's';
 
     const trimInfo = clip.trim_start && clip.trim_end
-      ? `${clip.trim_start} → ${clip.trim_end}`
+      ? clip.trim_start + ' \u2192 ' + clip.trim_end
       : 'Full video';
 
     const date = new Date(clip.created_at);
     const dateStr = date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
 
-    card.innerHTML = `
-      <div class="clip-card-thumb">
-        ${clip.thumbnail ? `<img src="${escapeAttr(clip.thumbnail)}" alt="${escapeAttr(clip.title)}">` : ''}
-        <span class="clip-platform-tag ${clip.platform}">${(PLATFORM_LABELS[clip.platform] || clip.platform)}</span>
-        <span class="clip-mode-tag">${trimInfo}</span>
-      </div>
-      <div class="clip-card-body">
-        <h4>${escapeHtml(clip.title)}</h4>
-        <div class="clip-meta">${escapeHtml(clip.channel || '')} · ${dateStr} · ${formatFileSize(clip.file_size || 0)}</div>
-        <div class="clip-card-actions">
-          <a class="clip-btn-dl" href="${escapeAttr(clip.download_url)}" download="${escapeAttr(clip.title + (clip.file_ext || '.mp4'))}">Download</a>
-          <button type="button" class="clip-btn-del" onclick="deleteClip('${clip.id}', this)">Delete</button>
-        </div>
-      </div>
-    `;
+    // Build tags HTML
+    let tagsHtml = '';
+    if (clip.tags) {
+      const tagArr = clip.tags.split(',').map(t => t.trim()).filter(Boolean);
+      if (tagArr.length) {
+        tagsHtml = '<div class="clip-tags">' +
+          tagArr.map(t => '<span class="clip-tag">' + escapeHtml(t) + '</span>').join('') +
+          '</div>';
+      }
+    }
+
+    const isChecked = selectedClipIds.has(clip.id);
+    const isFav = clip.is_favorite;
+
+    card.innerHTML =
+      '<div class="clip-card-thumb">' +
+        '<div class="clip-checkbox' + (isChecked ? ' checked' : '') + '" data-clip-id="' + clip.id + '" onclick="event.stopPropagation();onClipSelectChange(\'' + clip.id + '\')"></div>' +
+        '<button type="button" class="clip-favorite' + (isFav ? ' active' : '') + '" onclick="event.stopPropagation();toggleFavorite(\'' + clip.id + '\')" title="Favorite">' + (isFav ? '\u2605' : '\u2606') + '</button>' +
+        (clip.thumbnail ? '<img src="' + escapeAttr(clip.thumbnail) + '" alt="' + escapeAttr(clip.title) + '">' : '') +
+        '<span class="clip-platform-tag ' + clip.platform + '">' + (PLATFORM_LABELS[clip.platform] || clip.platform) + '</span>' +
+      '</div>' +
+      '<div class="clip-card-body">' +
+        '<h4>' + escapeHtml(clip.title) + '</h4>' +
+        tagsHtml +
+        '<div class="clip-meta">' + escapeHtml(clip.channel || '') + ' \u00b7 ' + dateStr + ' \u00b7 ' + formatFileSize(clip.file_size || 0) + '</div>' +
+        '<div class="clip-card-actions">' +
+          '<a class="clip-btn-dl" href="' + escapeAttr(clip.download_url) + '" download="' + escapeAttr(clip.title + (clip.file_ext || '.mp4')) + '">Download</a>' +
+          '<button type="button" class="clip-btn-del" onclick="deleteClip(\'' + clip.id + '\', this)">Delete</button>' +
+        '</div>' +
+      '</div>';
 
     grid.appendChild(card);
   });
@@ -2123,6 +2819,8 @@ async function deleteClip(id, btnEl) {
       const card = btnEl.closest('.clip-card');
       card.style.opacity = '0';
       card.style.transform = 'scale(0.9)';
+      selectedClipIds.delete(id);
+      updateBulkBar();
       setTimeout(() => { card.remove(); loadLibrary(); }, 300);
     }
   } catch (e) {
