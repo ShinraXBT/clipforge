@@ -207,6 +207,8 @@ def safe_ydl_opts(extra_opts=None):
         # Prevent loading config files from disk
         "ignoreerrors": False,
         "no_config": True,
+        # Enable Node.js runtime for YouTube signature decoding (required since yt-dlp 2025+)
+        "js_runtimes": "nodejs,deno",
     }
     if extra_opts:
         opts.update(extra_opts)
