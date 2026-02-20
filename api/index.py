@@ -191,18 +191,6 @@ def time_to_seconds(time_str):
     return max(0, min(secs, 36000))  # clamp to 10 hours max
 
 
-def _detect_js_runtimes():
-    """Detect if yt-dlp supports js_runtimes option (2025+)."""
-    try:
-        ydl = yt_dlp.YoutubeDL({"quiet": True, "js_runtimes": {"node": {}, "deno": {}}})
-        ydl.close()
-        return {"node": {}, "deno": {}}
-    except Exception:
-        return None
-
-_JS_RUNTIMES = _detect_js_runtimes()
-
-
 def safe_ydl_opts(extra_opts=None):
     """Base yt-dlp options with security hardening."""
     opts = {
@@ -220,9 +208,6 @@ def safe_ydl_opts(extra_opts=None):
         "ignoreerrors": False,
         "no_config": True,
     }
-    # Enable Node.js runtime for YouTube signature decoding (yt-dlp 2025+)
-    if _JS_RUNTIMES:
-        opts["js_runtimes"] = _JS_RUNTIMES
     if extra_opts:
         opts.update(extra_opts)
     return opts
@@ -817,10 +802,12 @@ def video_info():
             "thumbnail": info.get("thumbnail", ""),
             "channel": info.get("uploader") or info.get("uploader_id") or "Unknown",
         })
-    except yt_dlp.utils.DownloadError:
+    except yt_dlp.utils.DownloadError as e:
+        logger.warning("video-info DownloadError: %s", str(e)[:200])
         return jsonify({"error": "Could not fetch video info. The URL may be invalid or the video may be unavailable."}), 400
-    except Exception:
-        return jsonify({"error": "An unexpected error occurred while fetching video info."}), 500
+    except Exception as e:
+        logger.exception("video-info error: %s", str(e)[:200])
+        return jsonify({"error": f"An unexpected error occurred: {str(e)[:150]}"}), 500
 
 
 # ── API: Download (full video, no trim) ──────────────────────────────────────
