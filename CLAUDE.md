@@ -1,4 +1,4 @@
-# ClipForge — Multi-Platform Video Downloader & Trimmer
+# ClipForge — Multi-Platform Video Downloader, Trimmer & Post-Production Tool
 
 ## Architecture
 - **Single-file app**: `api/index.py` contains Flask backend + full HTML/CSS/JS frontend
@@ -9,6 +9,7 @@
 ## Tech Stack
 - Python / Flask
 - yt-dlp (video downloading)
+- FFmpeg (post-processing: video effects, GIF conversion, resize, subtitle burn)
 - Supabase (storage + DB + Auth)
 - PyJWT (JWT token verification for auth)
 - Vanilla HTML/CSS/JS frontend (no framework)
@@ -17,7 +18,9 @@
 ## UI Layout
 - Two-column layout: editor (left 57%) + library (right 43%)
 - Library is sticky-scrollable, always visible
-- Quality/format picker: resolution pills (360p–Best) + format pills (MP4/WebM/MP3)
+- Quality/format picker: resolution pills (360p–Best) + format pills (MP4/WebM/MP3/GIF)
+- Export row: platform presets (Original/TikTok/Square/Twitter/Discord/WhatsApp)
+- Subtitles toggle: auto-generated subtitle burn (YouTube auto-captions, Whisper fallback)
 - Save dialog with custom title + tag chips
 - Edit modal: click clip title to edit title/tags
 - Library toolbar: search, platform filter pills (6 platforms), sort dropdown
@@ -27,6 +30,9 @@
 - Toast notifications (success/error/info)
 - Skeleton loading cards + localStorage cache for instant perceived load
 - Pagination with "Load more" button
+- **Video Editor panel**: collapsible panel with speed, volume, rotate/flip, fade in/out, color effects (7 filter presets + manual sliders), and text overlay with position grid
+- CSS live preview of brightness/contrast/saturation/hue on player
+- Text overlay preview positioned over video player
 
 ## Supported Platforms
 YouTube, Twitter/X, Instagram, TikTok, Twitch, SoundCloud
@@ -40,9 +46,9 @@ YouTube, Twitter/X, Instagram, TikTok, Twitch, SoundCloud
 
 ## APIs
 - `POST /api/video-info` — fetch video metadata
-- `POST /api/download-full` — download full video (accepts quality/format)
-- `POST /api/trim` — trim + download (accepts quality/format)
-- `POST /api/save-to-library` — download + save to Supabase (with tags, quality/format)
+- `POST /api/download-full` — download full video (accepts quality/format/resize/subtitles/effects)
+- `POST /api/trim` — trim + download (accepts quality/format/resize/subtitles/effects)
+- `POST /api/save-to-library` — download + save to Supabase (with tags, quality/format/resize/subtitles/effects)
 - `GET /api/library` — list clips (paginated, user-scoped if authenticated)
 - `DELETE /api/library/<id>` — delete single clip
 - `PATCH /api/library/<id>` — edit clip title/tags
@@ -57,10 +63,12 @@ YouTube, Twitter/X, Instagram, TikTok, Twitch, SoundCloud
 - `SUPABASE_KEY` — Supabase anon key (for auth operations)
 - `SUPABASE_SERVICE_KEY` — Supabase service key (for storage/DB)
 - `SUPABASE_JWT_SECRET` — JWT secret for token verification
+- `OPENAI_API_KEY` — (optional) for Whisper subtitle fallback when platform subs unavailable
 
 ## How to Run
 ```bash
 pip install flask yt-dlp supabase PyJWT
+# FFmpeg must be installed and on PATH (required for GIF, resize, subtitles)
 python app.py
 # Runs at http://localhost:5000
 ```
@@ -88,3 +96,25 @@ CREATE POLICY "delete_own" ON clips FOR DELETE USING (auth.uid() = user_id);
 - localStorage cache for instant library load on repeat visits
 - Retry logic with exponential backoff for resilient API calls
 - Toast notifications replace alerts for non-blocking UX
+- Post-processing pipeline: effects → subtitles → resize → GIF (order matters)
+- Video editor effects: speed (0.25x–3x), volume, rotate (CW/CCW/180), flip (H/V), fade in/out, brightness/contrast/saturation/hue/temperature, text overlay with position
+- 7 filter presets: None, Warm, Cool, Vintage, B&W, Vivid, Cinema
+- All editor params validated server-side (clamped ranges, sanitized text, allowlisted strings)
+- Editor panel hidden when format is MP3 (audio-only, no video effects)
+- GIF: capped at 30s, 12fps, 480px, palette-optimized for file size
+- Resize presets: TikTok (9:16 crop), Square (1:1 crop), Twitter (16:9 pad), Discord (<25MB), WhatsApp (<16MB)
+- Subtitles: yt-dlp auto-subs first, Whisper API fallback if OPENAI_API_KEY set
+- Export/subtitle rows hidden when format is MP3 or GIF
+
+## Performance Optimizations (Feb 2026)
+- DocumentFragment for batch DOM rendering (library cards, waveform)
+- Debounced search input (200ms) to avoid re-render on every keystroke
+- Event delegation on library grid (single listener instead of per-card onclick)
+- Pre-parsed timestamps for sort (avoids creating Date objects in comparator)
+- requestAnimationFrame for timeline drag (smooth 60fps)
+- Targeted card update on select/deselect (no full DOM scan)
+- String-based escapeHtml (no DOM element creation per call)
+- Cached Intl.DateTimeFormat for date formatting
+- Lazy loading on thumbnail images (loading="lazy")
+- UUID validation on clip IDs before DOM injection (XSS prevention)
+- updateUserUI uses DOM API instead of innerHTML (security)

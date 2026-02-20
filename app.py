@@ -8,6 +8,7 @@ import os
 import re
 import uuid
 import time
+import subprocess
 import mimetypes
 import shutil
 from pathlib import Path
@@ -227,6 +228,11 @@ def build_format_string(quality="720p", fmt="mp4", is_trim=False):
             fmt_str = "best[ext=webm]/best"
         return fmt_str, []
 
+    # GIF: download as mp4 first, conversion happens in post_process
+    if fmt == "gif":
+        fmt_str = "best[ext=mp4][height<=480]/best[height<=480]/best"
+        return fmt_str, []
+
     # Default: mp4
     if height:
         fmt_str = f"best[ext=mp4][height<={height}]/best[height<={height}]/best"
@@ -252,6 +258,496 @@ def cleanup_job_dir(job_dir):
         shutil.rmtree(job_dir, ignore_errors=True)
     except Exception:
         pass
+
+
+# ── Post-processing helpers (GIF, Resize, Subtitles) ─────────────────────────
+
+RESIZE_PRESETS = {
+    "tiktok": {
+        "label": "TikTok 9:16",
+        "vf": "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920",
+    },
+    "square": {
+        "label": "Square 1:1",
+        "vf": "scale=1080:1080:force_original_aspect_ratio=increase,crop=1080:1080",
+    },
+    "twitter": {
+        "label": "Twitter 16:9",
+        "vf": "scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2",
+    },
+    "discord": {
+        "label": "Discord (<25MB)",
+        "max_size_mb": 25,
+    },
+    "whatsapp": {
+        "label": "WhatsApp (<16MB)",
+        "max_size_mb": 16,
+    },
+}
+
+VALID_RESIZE_PRESETS = set(RESIZE_PRESETS.keys())
+
+# ── Video Editor: Constants & Helpers ─────────────────────────────────────────
+
+EFFECT_RANGES = {
+    "speed":       (0.25, 3.0),
+    "volume":      (0.0, 1.5),
+    "brightness":  (-1.0, 1.0),
+    "contrast":    (0.0, 2.0),
+    "saturation":  (0.0, 3.0),
+    "hue":         (0, 360),
+    "temperature": (-1.0, 1.0),
+    "fade_in":     (0.0, 3.0),
+    "fade_out":    (0.0, 3.0),
+}
+
+VALID_ROTATIONS = {"none", "cw", "ccw", "180"}
+VALID_FLIPS = {"none", "h", "v", "hv"}
+
+FILTER_PRESETS = {
+    "none":    {"brightness": 0, "contrast": 1.0, "saturation": 1.0, "hue": 0, "temperature": 0},
+    "warm":    {"brightness": 0.05, "contrast": 1.1, "saturation": 1.2, "hue": 0, "temperature": 0.4},
+    "cool":    {"brightness": 0, "contrast": 1.05, "saturation": 1.1, "hue": 0, "temperature": -0.4},
+    "vintage": {"brightness": 0.1, "contrast": 0.9, "saturation": 0.7, "hue": 30, "temperature": 0.3},
+    "bw":      {"brightness": 0, "contrast": 1.2, "saturation": 0, "hue": 0, "temperature": 0},
+    "vivid":   {"brightness": 0.05, "contrast": 1.3, "saturation": 1.8, "hue": 0, "temperature": 0},
+    "cinema":  {"brightness": -0.05, "contrast": 1.2, "saturation": 0.85, "hue": 10, "temperature": 0.15},
+}
+
+
+def sanitize_ffmpeg_text(text):
+    """Escape special characters for FFmpeg drawtext filter (injection prevention)."""
+    if not text or not isinstance(text, str):
+        return ""
+    text = text[:200]  # cap length
+    for ch in ("\\", "'", ":", "[", "]", "%", ";", "{", "}"):
+        text = text.replace(ch, "\\" + ch)
+    return text
+
+
+def validate_effects(data):
+    """Extract and validate effects dict from request body. Returns clean dict or None."""
+    raw = data.get("effects")
+    if not raw or not isinstance(raw, dict):
+        return None
+
+    effects = {}
+
+    # Numeric params — clamp to safe ranges
+    for key, (lo, hi) in EFFECT_RANGES.items():
+        if key in raw:
+            try:
+                val = float(raw[key])
+                effects[key] = max(lo, min(hi, val))
+            except (ValueError, TypeError):
+                pass
+
+    # Rotation
+    rot = raw.get("rotate", "none")
+    if rot in VALID_ROTATIONS:
+        effects["rotate"] = rot
+
+    # Flip
+    flip = raw.get("flip", "none")
+    if flip in VALID_FLIPS:
+        effects["flip"] = flip
+
+    # Filter preset (informational, values already baked into individual params)
+    preset = raw.get("filter_preset", "none")
+    if preset in FILTER_PRESETS:
+        effects["filter_preset"] = preset
+
+    # Text overlay
+    text_overlays = raw.get("text_overlays")
+    if isinstance(text_overlays, list):
+        clean_overlays = []
+        for overlay in text_overlays[:5]:
+            if not isinstance(overlay, dict):
+                continue
+            text = sanitize_ffmpeg_text(overlay.get("text", ""))
+            if not text:
+                continue
+            # Validate color
+            color = overlay.get("color", "#FFFFFF")
+            if not isinstance(color, str) or not re.match(r'^#[0-9a-fA-F]{6}$', color):
+                color = "#FFFFFF"
+            # Font size
+            try:
+                fontsize = int(overlay.get("fontsize", 48))
+                fontsize = max(12, min(120, fontsize))
+            except (ValueError, TypeError):
+                fontsize = 48
+            # Position
+            position = overlay.get("position", "center")
+            valid_positions = {"top-left", "top-center", "top-right",
+                               "center-left", "center", "center-right",
+                               "bottom-left", "bottom-center", "bottom-right"}
+            if position not in valid_positions:
+                position = "center"
+            clean_overlays.append({
+                "text": text,
+                "color": color,
+                "fontsize": fontsize,
+                "position": position,
+            })
+        if clean_overlays:
+            effects["text_overlays"] = clean_overlays
+
+    # Check if any non-default values exist
+    defaults = {"speed": 1.0, "volume": 1.0, "brightness": 0, "contrast": 1.0,
+                "saturation": 1.0, "hue": 0, "temperature": 0, "fade_in": 0, "fade_out": 0,
+                "rotate": "none", "flip": "none", "filter_preset": "none"}
+    has_changes = False
+    for k, v in effects.items():
+        if k == "text_overlays":
+            has_changes = True
+            break
+        if k in defaults and v != defaults[k]:
+            has_changes = True
+            break
+
+    return effects if has_changes else None
+
+
+def get_video_duration(file_path):
+    """Get video duration in seconds via ffprobe."""
+    try:
+        probe = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", str(file_path)],
+            capture_output=True, text=True, timeout=30,
+        )
+        return float(probe.stdout.strip() or "0")
+    except Exception:
+        return 0
+
+
+def apply_effects(input_path, output_path, effects):
+    """Apply video/audio effects via a single FFmpeg command."""
+    vf_filters = []
+    af_filters = []
+
+    speed = effects.get("speed", 1.0)
+    volume = effects.get("volume", 1.0)
+    rotate = effects.get("rotate", "none")
+    flip = effects.get("flip", "none")
+    brightness = effects.get("brightness", 0)
+    contrast = effects.get("contrast", 1.0)
+    saturation = effects.get("saturation", 1.0)
+    hue = effects.get("hue", 0)
+    temperature = effects.get("temperature", 0)
+    fade_in = effects.get("fade_in", 0)
+    fade_out = effects.get("fade_out", 0)
+    text_overlays = effects.get("text_overlays", [])
+
+    # ── Video filters (order matters) ──
+
+    # Rotate
+    if rotate == "cw":
+        vf_filters.append("transpose=1")
+    elif rotate == "ccw":
+        vf_filters.append("transpose=2")
+    elif rotate == "180":
+        vf_filters.append("transpose=1,transpose=1")
+
+    # Flip
+    if flip == "h":
+        vf_filters.append("hflip")
+    elif flip == "v":
+        vf_filters.append("vflip")
+    elif flip == "hv":
+        vf_filters.append("hflip,vflip")
+
+    # Speed (video)
+    if speed != 1.0:
+        vf_filters.append(f"setpts=PTS/{speed}")
+
+    # Brightness / Contrast / Saturation (single eq filter)
+    if brightness != 0 or contrast != 1.0 or saturation != 1.0:
+        vf_filters.append(f"eq=brightness={brightness}:contrast={contrast}:saturation={saturation}")
+
+    # Hue
+    if hue != 0:
+        vf_filters.append(f"hue=h={hue}")
+
+    # Temperature (warm = red boost / blue cut, cool = opposite)
+    if temperature != 0:
+        rs = round(temperature * 0.3, 3)
+        gs = 0
+        bs = round(-temperature * 0.3, 3)
+        vf_filters.append(f"colorbalance=rs={rs}:gs={gs}:bs={bs}")
+
+    # Get duration for fade-out calculation
+    duration = get_video_duration(input_path)
+    effective_duration = duration / speed if speed != 1.0 else duration
+
+    # Fade in
+    if fade_in > 0:
+        vf_filters.append(f"fade=t=in:st=0:d={fade_in}")
+
+    # Fade out
+    if fade_out > 0 and effective_duration > fade_out:
+        fade_out_start = round(effective_duration - fade_out, 3)
+        vf_filters.append(f"fade=t=out:st={fade_out_start}:d={fade_out}")
+
+    # Text overlays
+    position_map = {
+        "top-left":      ("x=20", "y=20"),
+        "top-center":    ("x=(w-text_w)/2", "y=20"),
+        "top-right":     ("x=w-text_w-20", "y=20"),
+        "center-left":   ("x=20", "y=(h-text_h)/2"),
+        "center":        ("x=(w-text_w)/2", "y=(h-text_h)/2"),
+        "center-right":  ("x=w-text_w-20", "y=(h-text_h)/2"),
+        "bottom-left":   ("x=20", "y=h-text_h-20"),
+        "bottom-center": ("x=(w-text_w)/2", "y=h-text_h-20"),
+        "bottom-right":  ("x=w-text_w-20", "y=h-text_h-20"),
+    }
+    for overlay in text_overlays:
+        pos = position_map.get(overlay["position"], ("x=(w-text_w)/2", "y=(h-text_h)/2"))
+        # Convert hex color to FFmpeg format (FFmpeg uses hex without #)
+        color = overlay["color"]
+        vf_filters.append(
+            f"drawtext=text='{overlay['text']}':fontsize={overlay['fontsize']}"
+            f":fontcolor={color}:{pos[0]}:{pos[1]}"
+        )
+
+    # ── Audio filters ──
+
+    # Speed (audio) — atempo only accepts 0.5–2.0, chain for wider range
+    if speed != 1.0:
+        remaining = speed
+        while remaining > 2.0:
+            af_filters.append("atempo=2.0")
+            remaining /= 2.0
+        while remaining < 0.5:
+            af_filters.append("atempo=0.5")
+            remaining /= 0.5
+        af_filters.append(f"atempo={round(remaining, 4)}")
+
+    # Volume
+    if volume != 1.0:
+        af_filters.append(f"volume={volume}")
+
+    # Audio fade in/out
+    if fade_in > 0:
+        af_filters.append(f"afade=t=in:st=0:d={fade_in}")
+    if fade_out > 0 and effective_duration > fade_out:
+        fade_out_start = round(effective_duration - fade_out, 3)
+        af_filters.append(f"afade=t=out:st={fade_out_start}:d={fade_out}")
+
+    # ── Build FFmpeg command ──
+    cmd = ["ffmpeg", "-y", "-i", str(input_path)]
+
+    if vf_filters:
+        cmd += ["-vf", ",".join(vf_filters)]
+
+    if af_filters:
+        cmd += ["-af", ",".join(af_filters)]
+        cmd += ["-c:a", "aac", "-b:a", "128k"]
+    else:
+        cmd += ["-c:a", "copy"]
+
+    cmd += ["-c:v", "libx264", "-preset", "fast", "-crf", "23"]
+    cmd += [str(output_path)]
+
+    result = subprocess.run(cmd, capture_output=True, timeout=300)
+    if result.returncode != 0:
+        raise RuntimeError(f"Effects processing failed: {result.stderr.decode()[:200]}")
+
+
+def convert_to_gif(input_path, output_path):
+    """Convert a video to optimized GIF (max 30s, 12fps, 480px wide)."""
+    cmd = [
+        "ffmpeg", "-y", "-i", str(input_path),
+        "-t", "30",
+        "-vf", "fps=12,scale=480:-1:flags=lanczos,split[s0][s1];[s0]palettegen=max_colors=128[p];[s1][p]paletteuse=dither=bayer",
+        "-loop", "0",
+        str(output_path),
+    ]
+    result = subprocess.run(cmd, capture_output=True, timeout=120)
+    if result.returncode != 0:
+        raise RuntimeError(f"GIF conversion failed: {result.stderr.decode()[:200]}")
+
+
+def resize_video(input_path, output_path, preset):
+    """Resize/compress video for a target platform."""
+    preset_cfg = RESIZE_PRESETS.get(preset)
+    if not preset_cfg:
+        raise ValueError(f"Unknown resize preset: {preset}")
+
+    if "vf" in preset_cfg:
+        # Scale/crop preset
+        cmd = [
+            "ffmpeg", "-y", "-i", str(input_path),
+            "-vf", preset_cfg["vf"],
+            "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+            "-c:a", "aac", "-b:a", "128k",
+            str(output_path),
+        ]
+    else:
+        # Size-limited preset (discord/whatsapp): calculate bitrate from duration
+        max_bytes = preset_cfg["max_size_mb"] * 1024 * 1024
+        # Get duration via ffprobe
+        probe = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", str(input_path)],
+            capture_output=True, text=True, timeout=30,
+        )
+        duration = float(probe.stdout.strip() or "60")
+        # Target bitrate: total bits / duration, leaving 128kbps for audio
+        audio_bitrate = 128_000
+        target_total_bitrate = int((max_bytes * 8) / duration * 0.9)  # 90% safety margin
+        video_bitrate = max(100_000, target_total_bitrate - audio_bitrate)
+
+        cmd = [
+            "ffmpeg", "-y", "-i", str(input_path),
+            "-c:v", "libx264", "-preset", "fast",
+            "-b:v", str(video_bitrate),
+            "-maxrate", str(video_bitrate),
+            "-bufsize", str(video_bitrate * 2),
+            "-c:a", "aac", "-b:a", "128k",
+            str(output_path),
+        ]
+
+    result = subprocess.run(cmd, capture_output=True, timeout=300)
+    if result.returncode != 0:
+        raise RuntimeError(f"Resize failed: {result.stderr.decode()[:200]}")
+
+
+def download_subtitles(url, job_dir):
+    """Download auto-generated subtitles via yt-dlp. Returns SRT path or None."""
+    sub_opts = safe_ydl_opts({
+        "skip_download": True,
+        "writeautomaticsub": True,
+        "subtitleslangs": ["en", "fr"],
+        "subtitlesformat": "srt",
+        "outtmpl": str(job_dir / "subs.%(ext)s"),
+    })
+    try:
+        with yt_dlp.YoutubeDL(sub_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            # Check for downloaded subtitle files
+            for lang in ["en", "fr"]:
+                srt_path = job_dir / f"subs.{lang}.srt"
+                if srt_path.exists() and srt_path.stat().st_size > 0:
+                    return srt_path
+                # Also check vtt that may have been auto-converted
+                vtt_path = job_dir / f"subs.{lang}.vtt"
+                if vtt_path.exists() and vtt_path.stat().st_size > 0:
+                    # Convert VTT to SRT using ffmpeg
+                    srt_out = job_dir / f"subs.{lang}.srt"
+                    conv = subprocess.run(
+                        ["ffmpeg", "-y", "-i", str(vtt_path), str(srt_out)],
+                        capture_output=True, timeout=30,
+                    )
+                    if conv.returncode == 0 and srt_out.exists():
+                        return srt_out
+    except Exception:
+        logger.debug("Subtitle download failed", exc_info=True)
+
+    # Whisper fallback: if OPENAI_API_KEY is set, try transcription
+    openai_key = os.environ.get("OPENAI_API_KEY", "")
+    if openai_key:
+        try:
+            return _whisper_transcribe(url, job_dir, openai_key)
+        except Exception:
+            logger.debug("Whisper fallback failed", exc_info=True)
+
+    return None
+
+
+def _whisper_transcribe(url, job_dir, api_key):
+    """Fallback: extract audio and call OpenAI Whisper API for subtitles."""
+    import json
+    from urllib.request import Request, urlopen
+
+    # Extract audio from existing downloaded video
+    audio_path = None
+    for f in job_dir.iterdir():
+        if f.suffix in (".mp4", ".webm", ".mkv") and f.is_file():
+            audio_path = job_dir / "audio_for_whisper.mp3"
+            subprocess.run(
+                ["ffmpeg", "-y", "-i", str(f), "-vn", "-acodec", "mp3", "-ar", "16000", str(audio_path)],
+                capture_output=True, timeout=60,
+            )
+            break
+    if not audio_path or not audio_path.exists():
+        return None
+
+    # Call Whisper API
+    import io
+    boundary = uuid.uuid4().hex
+    body = io.BytesIO()
+    # model field
+    body.write(f"--{boundary}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nwhisper-1\r\n".encode())
+    # response_format field
+    body.write(f"--{boundary}\r\nContent-Disposition: form-data; name=\"response_format\"\r\n\r\nsrt\r\n".encode())
+    # file field
+    body.write(f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"audio.mp3\"\r\nContent-Type: audio/mpeg\r\n\r\n".encode())
+    body.write(audio_path.read_bytes())
+    body.write(f"\r\n--{boundary}--\r\n".encode())
+
+    req = Request(
+        "https://api.openai.com/v1/audio/transcriptions",
+        data=body.getvalue(),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+        },
+    )
+    with urlopen(req, timeout=120) as resp:
+        srt_content = resp.read().decode()
+
+    srt_path = job_dir / "whisper_subs.srt"
+    srt_path.write_text(srt_content, encoding="utf-8")
+    return srt_path
+
+
+def burn_subtitles(input_path, srt_path, output_path):
+    """Burn SRT subtitles into video with modern white-on-dark style."""
+    # FFmpeg subtitles filter needs forward slashes and escaped colons/backslashes
+    srt_str = str(srt_path).replace("\\", "/").replace(":", "\\:")
+    style = "FontSize=22,Bold=1,PrimaryColour=&H00FFFFFF,OutlineColour=&H40000000,BorderStyle=3,Outline=2,MarginV=35"
+    cmd = [
+        "ffmpeg", "-y", "-i", str(input_path),
+        "-vf", f"subtitles={srt_str}:force_style='{style}'",
+        "-c:a", "copy",
+        str(output_path),
+    ]
+    result = subprocess.run(cmd, capture_output=True, timeout=300)
+    if result.returncode != 0:
+        raise RuntimeError(f"Subtitle burn failed: {result.stderr.decode()[:200]}")
+
+
+def post_process(file_path, job_dir, fmt="mp4", resize=None, subtitles_path=None, effects=None):
+    """Run post-processing pipeline: effects → subtitles → resize → GIF conversion."""
+    current = Path(file_path)
+
+    # 1. Apply editor effects (only for video formats)
+    if effects and fmt not in ("mp3",):
+        output = job_dir / f"effects{current.suffix}"
+        apply_effects(current, output, effects)
+        current = output
+
+    # 2. Burn subtitles (only for video formats)
+    if subtitles_path and fmt not in ("mp3", "gif"):
+        output = job_dir / f"subbed{current.suffix}"
+        burn_subtitles(current, subtitles_path, output)
+        current = output
+
+    # 3. Resize for platform (only for video formats)
+    if resize and resize in VALID_RESIZE_PRESETS and fmt not in ("mp3", "gif"):
+        output = job_dir / f"resized{current.suffix}"
+        resize_video(current, output, resize)
+        current = output
+
+    # 4. GIF conversion (changes format entirely)
+    if fmt == "gif":
+        output = job_dir / "output.gif"
+        convert_to_gif(current, output)
+        current = output
+
+    return current
 
 
 # ── Serve frontend ───────────────────────────────────────────────────────────
@@ -330,15 +826,27 @@ def download_full():
     url = data.get("url", "")
     quality = data.get("quality", "720p")
     fmt = data.get("format", "mp4")
+    resize = data.get("resize", "")
+    subtitles = data.get("subtitles", False)
+    effects = validate_effects(data) if data.get("effects") else None
     platform, err = validate_url(url)
     if err:
         return jsonify({"error": err}), 400
+
+    # Validate resize preset
+    if resize and resize not in VALID_RESIZE_PRESETS:
+        return jsonify({"error": "Invalid resize preset."}), 400
 
     job_id = uuid.uuid4().hex[:12]
     job_dir = TEMP_DIR / job_id
     job_dir.mkdir(exist_ok=True)
 
     try:
+        # Download subtitles if requested
+        srt_path = None
+        if subtitles and fmt not in ("mp3", "gif"):
+            srt_path = download_subtitles(url, job_dir)
+
         output_template = str(job_dir / "video.%(ext)s")
         format_str, postprocessors = build_format_string(quality, fmt, is_trim=False)
 
@@ -358,15 +866,18 @@ def download_full():
         if not dl_file:
             return jsonify({"error": "Downloaded file not found."}), 500
 
+        # Post-process (effects, subtitles, resize, GIF)
+        final_file = post_process(dl_file, job_dir, fmt=fmt, resize=resize or None, subtitles_path=srt_path, effects=effects)
+
         # Check file size
-        if dl_file.stat().st_size > MAX_FILE_SIZE:
+        if final_file.stat().st_size > MAX_FILE_SIZE:
             cleanup_job_dir(job_dir)
             return jsonify({"error": "File too large (>100MB)."}), 413
 
-        ext = dl_file.suffix or ".mp4"
-        mime = mimetypes.guess_type(dl_file.name)[0] or "application/octet-stream"
+        ext = final_file.suffix or ".mp4"
+        mime = mimetypes.guess_type(final_file.name)[0] or "application/octet-stream"
         return send_file(
-            str(dl_file),
+            str(final_file),
             as_attachment=True,
             download_name=f"{platform}_{job_id}{ext}",
             mimetype=mime,
@@ -401,10 +912,17 @@ def trim_video():
     end_time = data.get("end", "0:00")
     quality = data.get("quality", "720p")
     fmt = data.get("format", "mp4")
+    resize = data.get("resize", "")
+    subtitles = data.get("subtitles", False)
+    effects = validate_effects(data) if data.get("effects") else None
 
     platform, err = validate_url(url)
     if err:
         return jsonify({"error": err}), 400
+
+    # Validate resize preset
+    if resize and resize not in VALID_RESIZE_PRESETS:
+        return jsonify({"error": "Invalid resize preset."}), 400
 
     start_sec = time_to_seconds(start_time)
     end_sec = time_to_seconds(end_time)
@@ -425,6 +943,11 @@ def trim_video():
     job_dir.mkdir(exist_ok=True)
 
     try:
+        # Download subtitles if requested
+        srt_path = None
+        if subtitles and fmt not in ("mp3", "gif"):
+            srt_path = download_subtitles(url, job_dir)
+
         output_template = str(job_dir / "clip.%(ext)s")
         format_str, postprocessors = build_format_string(quality, fmt, is_trim=True)
 
@@ -448,14 +971,17 @@ def trim_video():
         if not clip_file:
             return jsonify({"error": "Downloaded file not found."}), 500
 
-        if clip_file.stat().st_size > MAX_FILE_SIZE:
+        # Post-process (effects, subtitles, resize, GIF)
+        final_file = post_process(clip_file, job_dir, fmt=fmt, resize=resize or None, subtitles_path=srt_path, effects=effects)
+
+        if final_file.stat().st_size > MAX_FILE_SIZE:
             cleanup_job_dir(job_dir)
             return jsonify({"error": "File too large (>100MB)."}), 413
 
-        ext = clip_file.suffix or ".mp4"
-        mime = mimetypes.guess_type(clip_file.name)[0] or "application/octet-stream"
+        ext = final_file.suffix or ".mp4"
+        mime = mimetypes.guess_type(final_file.name)[0] or "application/octet-stream"
         return send_file(
-            str(clip_file),
+            str(final_file),
             as_attachment=True,
             download_name=f"clip_{job_id}{ext}",
             mimetype=mime,
@@ -542,16 +1068,28 @@ def save_to_library():
     tags = data.get("tags")  # comma-separated string or None
     quality = data.get("quality", "720p")
     fmt = data.get("format", "mp4")
+    resize = data.get("resize", "")
+    subtitles = data.get("subtitles", False)
+    effects = validate_effects(data) if data.get("effects") else None
 
     platform, err = validate_url(url)
     if err:
         return jsonify({"error": err}), 400
+
+    # Validate resize preset
+    if resize and resize not in VALID_RESIZE_PRESETS:
+        return jsonify({"error": "Invalid resize preset."}), 400
 
     job_id = uuid.uuid4().hex[:12]
     job_dir = TEMP_DIR / job_id
     job_dir.mkdir(exist_ok=True)
 
     try:
+        # Download subtitles if requested
+        srt_path = None
+        if subtitles and fmt not in ("mp3", "gif"):
+            srt_path = download_subtitles(url, job_dir)
+
         if mode == "trim":
             start_time = data.get("start", "0:00")
             end_time = data.get("end", "0:00")
@@ -600,13 +1138,16 @@ def save_to_library():
         if not dl_file:
             return jsonify({"error": "Downloaded file not found."}), 500
 
-        if dl_file.stat().st_size > MAX_FILE_SIZE:
+        # Post-process (effects, subtitles, resize, GIF)
+        final_file = post_process(dl_file, job_dir, fmt=fmt, resize=resize or None, subtitles_path=srt_path, effects=effects)
+
+        if final_file.stat().st_size > MAX_FILE_SIZE:
             cleanup_job_dir(job_dir)
             return jsonify({"error": "File too large (>100MB)."}), 413
 
         # Upload to Supabase
         user_id = require_auth()
-        result = upload_to_library(dl_file, {
+        result = upload_to_library(final_file, {
             "title": title,
             "platform": platform,
             "source_url": url,
@@ -1960,6 +2501,7 @@ body {
   display: -webkit-box;
   -webkit-line-clamp: 2;
   -webkit-box-orient: vertical;
+  cursor: pointer;
 }
 
 .clip-tags {
@@ -2087,6 +2629,249 @@ body {
 }
 .quality-pill:hover, .format-pill:hover { border-color: var(--border-light); color: var(--text-secondary); }
 .quality-pill.active, .format-pill.active { border-color: var(--accent); background: var(--accent-dim); color: var(--accent); }
+.export-pill {
+  padding: 0.3rem 0.65rem;
+  border-radius: 100px;
+  font-size: 0.72rem;
+  font-weight: 500;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+.export-pill:hover { border-color: var(--border-light); color: var(--text-secondary); }
+.export-pill.active { border-color: var(--accent); background: var(--accent-dim); color: var(--accent); }
+.subtitle-row { display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.5rem; }
+.subtitle-check { display: flex; align-items: center; gap: 0.4rem; cursor: pointer; font-size: 0.78rem; color: var(--text-secondary); }
+.subtitle-check input[type="checkbox"] {
+  accent-color: var(--accent);
+  width: 14px; height: 14px;
+  cursor: pointer;
+}
+.subtitle-note {
+  font-size: 0.65rem;
+  color: var(--text-muted);
+  margin-left: 0.25rem;
+}
+.gif-note {
+  font-size: 0.65rem;
+  color: var(--text-muted);
+  margin-left: 0.5rem;
+  display: none;
+}
+.gif-note.visible { display: inline; }
+
+/* ── Video Editor Panel ───────────────────────── */
+.editor-panel {
+  display: none;
+  margin-bottom: 0.75rem;
+}
+.editor-panel.visible { display: block; }
+.editor-panel .panel-label {
+  cursor: pointer;
+  user-select: none;
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+.editor-panel .panel-label .toggle-icon {
+  font-size: 0.7rem;
+  transition: transform 0.2s;
+  margin-left: auto;
+}
+.editor-panel .panel-label .toggle-icon.collapsed { transform: rotate(-90deg); }
+.editor-content {
+  max-height: 2000px;
+  overflow: hidden;
+  transition: max-height 0.3s ease;
+  padding-top: 0.5rem;
+}
+.editor-content.collapsed { max-height: 0; padding-top: 0; }
+.editor-section {
+  padding: 0.5rem 0;
+  border-bottom: 1px solid var(--border);
+}
+.editor-section:last-child { border-bottom: none; }
+.editor-section-title {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.6rem;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  margin-bottom: 0.4rem;
+}
+.editor-slider-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 0.35rem;
+}
+.editor-slider-row label {
+  font-size: 0.72rem;
+  color: var(--text-secondary);
+  min-width: 75px;
+  flex-shrink: 0;
+}
+.editor-slider-row input[type="range"] {
+  flex: 1;
+  height: 4px;
+  -webkit-appearance: none;
+  appearance: none;
+  background: var(--border);
+  border-radius: 2px;
+  outline: none;
+  cursor: pointer;
+}
+.editor-slider-row input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--accent);
+  border: 2px solid var(--bg-surface);
+  cursor: pointer;
+}
+.editor-slider-row input[type="range"]::-moz-range-thumb {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--accent);
+  border: 2px solid var(--bg-surface);
+  cursor: pointer;
+}
+.editor-slider-val {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.68rem;
+  color: var(--text-muted);
+  min-width: 42px;
+  text-align: right;
+}
+.editor-pills {
+  display: flex;
+  gap: 0.25rem;
+  flex-wrap: wrap;
+  margin-bottom: 0.35rem;
+}
+.editor-pill {
+  padding: 0.25rem 0.55rem;
+  border-radius: 100px;
+  font-size: 0.68rem;
+  font-weight: 500;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+.editor-pill:hover { border-color: var(--border-light); color: var(--text-secondary); }
+.editor-pill.active { border-color: var(--accent); background: var(--accent-dim); color: var(--accent); }
+.editor-icon-btns {
+  display: flex;
+  gap: 0.35rem;
+  flex-wrap: wrap;
+}
+.editor-icon-btn {
+  width: 36px;
+  height: 36px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.85rem;
+  transition: all 0.15s ease;
+}
+.editor-icon-btn:hover { border-color: var(--border-light); color: var(--text-primary); }
+.editor-icon-btn.active { border-color: var(--accent); background: var(--accent-dim); color: var(--accent); }
+.editor-position-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 28px);
+  grid-template-rows: repeat(3, 28px);
+  gap: 3px;
+}
+.editor-pos-cell {
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: transparent;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  padding: 0;
+}
+.editor-pos-cell:hover { border-color: var(--border-light); }
+.editor-pos-cell.active { border-color: var(--accent); background: var(--accent-dim); }
+.editor-text-input {
+  width: 100%;
+  padding: 0.4rem 0.6rem;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: var(--bg-elevated);
+  color: var(--text-primary);
+  font-size: 0.78rem;
+  outline: none;
+  margin-bottom: 0.4rem;
+}
+.editor-text-input:focus { border-color: var(--accent); }
+.editor-text-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.75rem;
+}
+.editor-text-controls { display: flex; flex-direction: column; gap: 0.35rem; }
+.editor-color-input {
+  width: 32px;
+  height: 32px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  cursor: pointer;
+  padding: 2px;
+}
+.editor-reset-btn {
+  background: none;
+  border: none;
+  color: var(--accent);
+  font-size: 0.72rem;
+  cursor: pointer;
+  padding: 0.3rem 0;
+  margin-top: 0.25rem;
+  opacity: 0.8;
+}
+.editor-reset-btn:hover { opacity: 1; text-decoration: underline; }
+.text-preview-overlay {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 5;
+  overflow: hidden;
+}
+.text-preview-item {
+  position: absolute;
+  font-weight: 700;
+  text-shadow: 1px 1px 3px rgba(0,0,0,0.7);
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-width: 90%;
+}
+.editor-mute-btn {
+  width: 36px;
+  height: 28px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  font-size: 0.75rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  transition: all 0.15s ease;
+}
+.editor-mute-btn.active { border-color: #e74c3c; color: #e74c3c; background: rgba(231,76,60,0.1); }
 
 /* ── Edit Modal ────────────────────────────────── */
 .edit-modal-overlay {
@@ -2395,6 +3180,7 @@ body {
         </div>
         <div class="player-wrap" id="playerWrap">
           <iframe id="ytPlayer" src="" allow="autoplay; encrypted-media" allowfullscreen sandbox="allow-scripts allow-same-origin allow-popups"></iframe>
+          <div class="text-preview-overlay" id="textPreviewOverlay"></div>
         </div>
       </div>
 
@@ -2422,7 +3208,164 @@ body {
             <button type="button" class="format-pill active" data-f="mp4">MP4</button>
             <button type="button" class="format-pill" data-f="webm">WebM</button>
             <button type="button" class="format-pill" data-f="mp3">MP3</button>
+            <button type="button" class="format-pill" data-f="gif">GIF</button>
           </div>
+          <span class="gif-note" id="gifNote">Max 30 seconds</span>
+        </div>
+        <div class="quality-row" id="exportRow">
+          <span class="quality-label">Export</span>
+          <div class="quality-group" id="exportGroup">
+            <button type="button" class="export-pill active" data-r="">Original</button>
+            <button type="button" class="export-pill" data-r="tiktok">TikTok 9:16</button>
+            <button type="button" class="export-pill" data-r="square">Square 1:1</button>
+            <button type="button" class="export-pill" data-r="twitter">Twitter 16:9</button>
+            <button type="button" class="export-pill" data-r="discord">Discord</button>
+            <button type="button" class="export-pill" data-r="whatsapp">WhatsApp</button>
+          </div>
+        </div>
+        <div class="subtitle-row" id="subtitleRow">
+          <span class="quality-label">Subs</span>
+          <label class="subtitle-check">
+            <input type="checkbox" id="subtitleCheck">
+            Add auto-subtitles
+          </label>
+          <span class="subtitle-note" id="subtitleNote"></span>
+        </div>
+      </div>
+
+      <!-- Video Editor -->
+      <div class="panel editor-panel" id="editorPanel">
+        <div class="panel-label" onclick="toggleEditorPanel()">
+          <span class="dot"></span> EDITOR <span class="toggle-icon" id="editorToggleIcon">&#9662;</span>
+        </div>
+        <div class="editor-content" id="editorContent">
+
+          <!-- Speed -->
+          <div class="editor-section">
+            <div class="editor-section-title">Speed</div>
+            <div class="editor-pills">
+              <button type="button" class="editor-pill" data-speed="0.5" onclick="setEditorSpeed(0.5)">0.5x</button>
+              <button type="button" class="editor-pill active" data-speed="1" onclick="setEditorSpeed(1)">1x</button>
+              <button type="button" class="editor-pill" data-speed="1.5" onclick="setEditorSpeed(1.5)">1.5x</button>
+              <button type="button" class="editor-pill" data-speed="2" onclick="setEditorSpeed(2)">2x</button>
+            </div>
+            <div class="editor-slider-row">
+              <label>Speed</label>
+              <input type="range" id="editorSpeed" min="25" max="300" step="5" value="100">
+              <span class="editor-slider-val" id="editorSpeedVal">1.0x</span>
+            </div>
+          </div>
+
+          <!-- Volume -->
+          <div class="editor-section">
+            <div class="editor-section-title">Volume</div>
+            <div class="editor-slider-row">
+              <button type="button" class="editor-mute-btn" id="editorMuteBtn" onclick="toggleEditorMute()">&#128266;</button>
+              <input type="range" id="editorVolume" min="0" max="150" step="1" value="100">
+              <span class="editor-slider-val" id="editorVolumeVal">100%</span>
+            </div>
+          </div>
+
+          <!-- Transform -->
+          <div class="editor-section">
+            <div class="editor-section-title">Transform</div>
+            <div class="editor-icon-btns">
+              <button type="button" class="editor-icon-btn" id="btnRotCCW" onclick="setEditorRotate('ccw')" title="Rotate CCW">&#8634;</button>
+              <button type="button" class="editor-icon-btn" id="btnRotCW" onclick="setEditorRotate('cw')" title="Rotate CW">&#8635;</button>
+              <button type="button" class="editor-icon-btn" id="btnRot180" onclick="setEditorRotate('180')" title="Rotate 180">&#8693;</button>
+              <button type="button" class="editor-icon-btn" id="btnFlipH" onclick="setEditorFlip('h')" title="Flip Horizontal">&#8596;</button>
+              <button type="button" class="editor-icon-btn" id="btnFlipV" onclick="setEditorFlip('v')" title="Flip Vertical">&#8597;</button>
+            </div>
+          </div>
+
+          <!-- Fade -->
+          <div class="editor-section">
+            <div class="editor-section-title">Fade</div>
+            <div class="editor-slider-row">
+              <label>Fade In</label>
+              <input type="range" id="editorFadeIn" min="0" max="30" step="1" value="0">
+              <span class="editor-slider-val" id="editorFadeInVal">0.0s</span>
+            </div>
+            <div class="editor-slider-row">
+              <label>Fade Out</label>
+              <input type="range" id="editorFadeOut" min="0" max="30" step="1" value="0">
+              <span class="editor-slider-val" id="editorFadeOutVal">0.0s</span>
+            </div>
+          </div>
+
+          <!-- Effects -->
+          <div class="editor-section">
+            <div class="editor-section-title">Effects</div>
+            <div class="editor-pills" id="filterPresetGroup">
+              <button type="button" class="editor-pill active" data-filter="none" onclick="setFilterPreset('none')">None</button>
+              <button type="button" class="editor-pill" data-filter="warm" onclick="setFilterPreset('warm')">Warm</button>
+              <button type="button" class="editor-pill" data-filter="cool" onclick="setFilterPreset('cool')">Cool</button>
+              <button type="button" class="editor-pill" data-filter="vintage" onclick="setFilterPreset('vintage')">Vintage</button>
+              <button type="button" class="editor-pill" data-filter="bw" onclick="setFilterPreset('bw')">B&W</button>
+              <button type="button" class="editor-pill" data-filter="vivid" onclick="setFilterPreset('vivid')">Vivid</button>
+              <button type="button" class="editor-pill" data-filter="cinema" onclick="setFilterPreset('cinema')">Cinema</button>
+            </div>
+            <div class="editor-slider-row">
+              <label>Brightness</label>
+              <input type="range" id="editorBrightness" min="-100" max="100" step="1" value="0">
+              <span class="editor-slider-val" id="editorBrightnessVal">0</span>
+            </div>
+            <div class="editor-slider-row">
+              <label>Contrast</label>
+              <input type="range" id="editorContrast" min="0" max="200" step="1" value="100">
+              <span class="editor-slider-val" id="editorContrastVal">100</span>
+            </div>
+            <div class="editor-slider-row">
+              <label>Saturation</label>
+              <input type="range" id="editorSaturation" min="0" max="300" step="1" value="100">
+              <span class="editor-slider-val" id="editorSaturationVal">100</span>
+            </div>
+            <div class="editor-slider-row">
+              <label>Hue</label>
+              <input type="range" id="editorHue" min="0" max="360" step="1" value="0">
+              <span class="editor-slider-val" id="editorHueVal">0&deg;</span>
+            </div>
+            <div class="editor-slider-row">
+              <label>Temperature</label>
+              <input type="range" id="editorTemperature" min="-100" max="100" step="1" value="0">
+              <span class="editor-slider-val" id="editorTemperatureVal">0</span>
+            </div>
+          </div>
+
+          <!-- Text Overlay -->
+          <div class="editor-section">
+            <div class="editor-section-title">Text Overlay</div>
+            <input type="text" class="editor-text-input" id="editorTextInput" placeholder="Type text to overlay..." maxlength="200">
+            <div class="editor-text-row">
+              <div class="editor-text-controls">
+                <div class="editor-section-title" style="margin-bottom:0.2rem">Position</div>
+                <div class="editor-position-grid" id="editorPosGrid">
+                  <button type="button" class="editor-pos-cell" data-pos="top-left"></button>
+                  <button type="button" class="editor-pos-cell" data-pos="top-center"></button>
+                  <button type="button" class="editor-pos-cell" data-pos="top-right"></button>
+                  <button type="button" class="editor-pos-cell" data-pos="center-left"></button>
+                  <button type="button" class="editor-pos-cell active" data-pos="center"></button>
+                  <button type="button" class="editor-pos-cell" data-pos="center-right"></button>
+                  <button type="button" class="editor-pos-cell" data-pos="bottom-left"></button>
+                  <button type="button" class="editor-pos-cell" data-pos="bottom-center"></button>
+                  <button type="button" class="editor-pos-cell" data-pos="bottom-right"></button>
+                </div>
+              </div>
+              <div style="flex:1">
+                <div class="editor-slider-row">
+                  <label>Size</label>
+                  <input type="range" id="editorFontSize" min="12" max="120" step="1" value="48">
+                  <span class="editor-slider-val" id="editorFontSizeVal">48px</span>
+                </div>
+                <div class="editor-slider-row">
+                  <label>Color</label>
+                  <input type="color" class="editor-color-input" id="editorTextColor" value="#FFFFFF">
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <button type="button" class="editor-reset-btn" onclick="resetEditorState()">Reset All Effects</button>
         </div>
       </div>
 
@@ -2515,7 +3458,7 @@ body {
         <div class="panel-label"><span class="dot"></span> My Library</div>
 
         <div class="library-toolbar">
-          <input type="text" class="library-search" id="librarySearch" placeholder="Search clips by title or tag..." oninput="applyLibraryView()">
+          <input type="text" class="library-search" id="librarySearch" placeholder="Search clips by title or tag...">
           <div class="library-filters" id="libraryFilters">
             <button type="button" class="filter-pill active" onclick="setFilter('all')">All</button>
             <button type="button" class="filter-pill" onclick="setFilter('youtube')">YouTube</button>
@@ -2610,6 +3553,17 @@ let dragging = null;
 // Quality/format state
 let currentQuality = '720p';
 let currentFormat = 'mp4';
+let currentResize = '';
+let currentSubtitles = false;
+
+// Editor state
+let editorState = {
+  speed: 1.0, volume: 1.0, rotate: 'none', flip: 'none',
+  fade_in: 0, fade_out: 0, brightness: 0, contrast: 1.0,
+  saturation: 1.0, hue: 0, temperature: 0, filter_preset: 'none',
+  text_overlays: []
+};
+let editorCollapsed = false;
 
 // Library state
 let allClips = [];
@@ -2753,7 +3707,16 @@ async function loadVideo() {
     document.getElementById('previewSection').classList.add('visible');
     document.getElementById('modeToggle').classList.add('visible');
     document.getElementById('qualitySection').classList.add('visible');
+    document.getElementById('editorPanel').classList.add('visible');
     document.getElementById('actionSection').classList.add('visible');
+
+    // Update subtitle note based on platform
+    const subNote = document.getElementById('subtitleNote');
+    if (currentPlatform === 'youtube') {
+      subNote.textContent = '(YouTube auto-captions)';
+    } else {
+      subNote.textContent = '(auto-generated if available)';
+    }
 
     // Default mode: download for short videos / non-YT, trim for YT
     if (currentPlatform === 'youtube' && videoDuration > 30) {
@@ -2803,12 +3766,14 @@ function setMode(mode) {
 function generateWaveform() {
   const container = document.getElementById('waveform');
   container.innerHTML = '';
+  const frag = document.createDocumentFragment();
   for (let i = 0; i < 120; i++) {
     const bar = document.createElement('div');
     bar.className = 'bar';
     bar.style.height = (8 + Math.random() * 30) + 'px';
-    container.appendChild(bar);
+    frag.appendChild(bar);
   }
+  container.appendChild(frag);
 }
 
 function updateTimeline() {
@@ -2831,19 +3796,26 @@ function updateTimeline() {
   el.addEventListener('touchstart', e => { dragging = id; }, { passive: true });
 });
 
+let _rafPending = false;
 function handleMove(clientX) {
   if (!dragging) return;
-  const track = document.getElementById('timelineTrack');
-  const rect = track.getBoundingClientRect();
-  let pct = Math.max(0, Math.min(100, ((clientX - rect.left) / rect.width) * 100));
-  const sec = (pct / 100) * videoDuration;
+  if (_rafPending) return;
+  _rafPending = true;
+  requestAnimationFrame(() => {
+    _rafPending = false;
+    if (!dragging) return;
+    const track = document.getElementById('timelineTrack');
+    const rect = track.getBoundingClientRect();
+    let pct = Math.max(0, Math.min(100, ((clientX - rect.left) / rect.width) * 100));
+    const sec = (pct / 100) * videoDuration;
 
-  if (dragging === 'handleStart') {
-    document.getElementById('startInput').value = formatTime(Math.floor(sec));
-  } else {
-    document.getElementById('endInput').value = formatTime(Math.floor(sec));
-  }
-  updateTimeline();
+    if (dragging === 'handleStart') {
+      document.getElementById('startInput').value = formatTime(Math.floor(sec));
+    } else {
+      document.getElementById('endInput').value = formatTime(Math.floor(sec));
+    }
+    updateTimeline();
+  });
 }
 
 document.addEventListener('mousemove', e => handleMove(e.clientX));
@@ -2903,13 +3875,17 @@ async function startAction() {
     }
 
     endpoint = '/api/trim';
-    body = { url, start, end, quality: currentQuality, format: currentFormat };
+    body = { url, start, end, quality: currentQuality, format: currentFormat, resize: currentResize, subtitles: currentSubtitles };
+    const fx1 = getEffectsPayload();
+    if (fx1) body.effects = fx1;
     infoText = `Trimmed from ${start} to ${end}`;
     document.getElementById('progressStatus').innerHTML =
       '<span class="spinner"></span> Downloading & trimming your clip...';
   } else {
     endpoint = '/api/download-full';
-    body = { url, quality: currentQuality, format: currentFormat };
+    body = { url, quality: currentQuality, format: currentFormat, resize: currentResize, subtitles: currentSubtitles };
+    const fx2 = getEffectsPayload();
+    if (fx2) body.effects = fx2;
     infoText = `Full video from ${PLATFORM_LABELS[currentPlatform] || 'source'}`;
     document.getElementById('progressStatus').innerHTML =
       '<span class="spinner"></span> Downloading video...';
@@ -2991,6 +3967,8 @@ function resetAll() {
     document.getElementById(id).classList.remove('visible'));
   document.getElementById('modeToggle').classList.remove('visible');
   document.getElementById('qualitySection').classList.remove('visible');
+  document.getElementById('editorPanel').classList.remove('visible');
+  resetEditorState();
   document.getElementById('urlInput').value = '';
   document.getElementById('urlInput').focus();
   document.getElementById('btnAction').disabled = false;
@@ -3002,8 +3980,12 @@ function resetAll() {
   currentMode = 'download';
   currentQuality = '720p';
   currentFormat = 'mp4';
+  currentResize = '';
+  currentSubtitles = false;
+  document.getElementById('subtitleCheck').checked = false;
   updateQualityPills();
   updateFormatPills();
+  updateExportPills();
 }
 
 // ── Utilities ───────────────────────────────
@@ -3103,7 +4085,11 @@ async function saveToLibrary() {
     tags: tagsStr,
     quality: currentQuality,
     format: currentFormat,
+    resize: currentResize,
+    subtitles: currentSubtitles,
   };
+  const fxSave = getEffectsPayload();
+  if (fxSave) body.effects = fxSave;
 
   if (currentMode === 'trim') {
     body.start = document.getElementById('startInput').value.trim();
@@ -3194,14 +4180,21 @@ function showLibrarySkeleton() {
   }
 }
 
+// Debounce helper
+function debounce(fn, ms) {
+  let timer;
+  return function(...args) {
+    clearTimeout(timer);
+    timer = setTimeout(() => fn.apply(this, args), ms);
+  };
+}
+
 function applyLibraryView() {
   const search = (document.getElementById('librarySearch').value || '').toLowerCase();
   const sort = document.getElementById('librarySort').value;
 
   let filtered = allClips.filter(c => {
-    // Platform filter
     if (currentFilter !== 'all' && c.platform !== currentFilter) return false;
-    // Search filter
     if (search) {
       const title = (c.title || '').toLowerCase();
       const tags = (c.tags || '').toLowerCase();
@@ -3210,22 +4203,33 @@ function applyLibraryView() {
     return true;
   });
 
-  // Sort
+  // Sort — use pre-parsed timestamps to avoid creating Date objects in comparator
+  if (sort === 'newest' || sort === 'oldest') {
+    for (let i = 0; i < filtered.length; i++) {
+      if (filtered[i]._ts === undefined) filtered[i]._ts = new Date(filtered[i].created_at).getTime();
+    }
+  }
   filtered.sort((a, b) => {
-    if (sort === 'newest') return new Date(b.created_at) - new Date(a.created_at);
-    if (sort === 'oldest') return new Date(a.created_at) - new Date(b.created_at);
+    if (sort === 'newest') return b._ts - a._ts;
+    if (sort === 'oldest') return a._ts - b._ts;
     if (sort === 'largest') return (b.file_size || 0) - (a.file_size || 0);
     if (sort === 'smallest') return (a.file_size || 0) - (b.file_size || 0);
     return 0;
   });
 
-  // Pin favorites to top
-  const favs = filtered.filter(c => c.is_favorite);
-  const rest = filtered.filter(c => !c.is_favorite);
-  filtered = [...favs, ...rest];
+  // Pin favorites to top (single pass partition)
+  const favs = [];
+  const rest = [];
+  for (let i = 0; i < filtered.length; i++) {
+    (filtered[i].is_favorite ? favs : rest).push(filtered[i]);
+  }
+  if (favs.length > 0) filtered = favs.concat(rest);
 
   renderLibrary(filtered);
 }
+
+// Debounced search input
+document.getElementById('librarySearch').addEventListener('input', debounce(applyLibraryView, 200));
 
 function setFilter(platform) {
   currentFilter = platform;
@@ -3253,20 +4257,21 @@ async function toggleFavorite(clipId) {
 }
 
 function onClipSelectChange(clipId) {
-  if (selectedClipIds.has(clipId)) {
+  const isSelected = selectedClipIds.has(clipId);
+  if (isSelected) {
     selectedClipIds.delete(clipId);
   } else {
     selectedClipIds.add(clipId);
   }
   updateBulkBar();
-  // Update card visual
-  document.querySelectorAll('.clip-card').forEach(card => {
+  // Update only the affected card (not all cards)
+  const card = document.querySelector('.clip-card[data-clip-id="' + clipId + '"]');
+  if (card) {
+    const nowSelected = !isSelected;
+    card.classList.toggle('selected', nowSelected);
     const cb = card.querySelector('.clip-checkbox');
-    if (!cb) return;
-    const id = cb.dataset.clipId;
-    card.classList.toggle('selected', selectedClipIds.has(id));
-    cb.classList.toggle('checked', selectedClipIds.has(id));
-  });
+    if (cb) cb.classList.toggle('checked', nowSelected);
+  }
 }
 
 function toggleSelectAll() {
@@ -3336,12 +4341,16 @@ function bulkDownload() {
   });
 }
 
+const _dateFormatter = new Intl.DateTimeFormat('en-US', { month: 'short', day: 'numeric' });
+
 function renderLibrary(clips) {
   const grid = document.getElementById('libraryGrid');
   const empty = document.getElementById('libraryEmpty');
   const stats = document.getElementById('libraryStats');
 
-  grid.querySelectorAll('.clip-card, .skeleton-card').forEach(el => el.remove());
+  // Remove old cards in one batch
+  const oldCards = grid.querySelectorAll('.clip-card, .skeleton-card');
+  for (let i = oldCards.length - 1; i >= 0; i--) oldCards[i].remove();
 
   if (clips.length === 0) {
     empty.style.display = '';
@@ -3352,54 +4361,61 @@ function renderLibrary(clips) {
   }
 
   empty.style.display = 'none';
-  const totalSize = clips.reduce((sum, c) => sum + (c.file_size || 0), 0);
+  let totalSize = 0;
+  for (let i = 0; i < clips.length; i++) totalSize += (clips[i].file_size || 0);
   stats.textContent = clips.length + ' clip' + (clips.length !== 1 ? 's' : '') + ' \u00b7 ' + formatFileSize(totalSize);
 
-  clips.forEach((clip, i) => {
+  // Build all cards in a DocumentFragment (single DOM insertion)
+  const frag = document.createDocumentFragment();
+
+  for (let i = 0; i < clips.length; i++) {
+    const clip = clips[i];
+    const safeId = isValidUUID(clip.id) ? clip.id : '';
+    if (!safeId) continue;
+
     const card = document.createElement('div');
-    card.className = 'clip-card' + (selectedClipIds.has(clip.id) ? ' selected' : '');
-    card.style.animationDelay = (i * 0.03) + 's';
+    card.className = 'clip-card' + (selectedClipIds.has(safeId) ? ' selected' : '');
+    card.dataset.clipId = safeId;
 
-    const trimInfo = clip.trim_start && clip.trim_end
-      ? clip.trim_start + ' \u2192 ' + clip.trim_end
-      : 'Full video';
-
-    const date = new Date(clip.created_at);
-    const dateStr = date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+    const dateStr = _dateFormatter.format(new Date(clip.created_at));
 
     // Build tags HTML
     let tagsHtml = '';
     if (clip.tags) {
-      const tagArr = clip.tags.split(',').map(t => t.trim()).filter(Boolean);
-      if (tagArr.length) {
-        tagsHtml = '<div class="clip-tags">' +
-          tagArr.map(t => '<span class="clip-tag">' + escapeHtml(t) + '</span>').join('') +
-          '</div>';
+      const tagArr = clip.tags.split(',');
+      let tagParts = '';
+      for (let j = 0; j < tagArr.length; j++) {
+        const t = tagArr[j].trim();
+        if (t) tagParts += '<span class="clip-tag">' + escapeHtml(t) + '</span>';
       }
+      if (tagParts) tagsHtml = '<div class="clip-tags">' + tagParts + '</div>';
     }
 
-    const isChecked = selectedClipIds.has(clip.id);
+    const isChecked = selectedClipIds.has(safeId);
     const isFav = clip.is_favorite;
+    const safePlatform = escapeAttr(clip.platform || 'unknown');
 
     card.innerHTML =
       '<div class="clip-card-thumb">' +
-        '<div class="clip-checkbox' + (isChecked ? ' checked' : '') + '" data-clip-id="' + clip.id + '" onclick="event.stopPropagation();onClipSelectChange(\'' + clip.id + '\')"></div>' +
-        '<button type="button" class="clip-favorite' + (isFav ? ' active' : '') + '" onclick="event.stopPropagation();toggleFavorite(\'' + clip.id + '\')" title="Favorite">' + (isFav ? '\u2605' : '\u2606') + '</button>' +
-        (clip.thumbnail ? '<img src="' + escapeAttr(clip.thumbnail) + '" alt="' + escapeAttr(clip.title) + '">' : '') +
-        '<span class="clip-platform-tag ' + clip.platform + '">' + (PLATFORM_LABELS[clip.platform] || clip.platform) + '</span>' +
+        '<div class="clip-checkbox' + (isChecked ? ' checked' : '') + '" data-clip-id="' + safeId + '"></div>' +
+        '<button type="button" class="clip-favorite' + (isFav ? ' active' : '') + '" data-clip-id="' + safeId + '" title="Favorite">' + (isFav ? '\u2605' : '\u2606') + '</button>' +
+        (clip.thumbnail ? '<img src="' + escapeAttr(clip.thumbnail) + '" alt="' + escapeAttr(clip.title) + '" loading="lazy">' : '') +
+        '<span class="clip-platform-tag ' + safePlatform + '">' + escapeHtml(PLATFORM_LABELS[clip.platform] || clip.platform) + '</span>' +
       '</div>' +
       '<div class="clip-card-body">' +
-        '<h4 style="cursor:pointer" onclick="openEditModal(\'' + clip.id + '\')" title="Click to edit">' + escapeHtml(clip.title) + '</h4>' +
+        '<h4 class="clip-title-edit" data-clip-id="' + safeId + '" title="Click to edit">' + escapeHtml(clip.title) + '</h4>' +
         tagsHtml +
         '<div class="clip-meta">' + escapeHtml(clip.channel || '') + ' \u00b7 ' + dateStr + ' \u00b7 ' + formatFileSize(clip.file_size || 0) + '</div>' +
         '<div class="clip-card-actions">' +
-          '<a class="clip-btn-dl" href="' + escapeAttr(clip.download_url) + '" download="' + escapeAttr(clip.title + (clip.file_ext || '.mp4')) + '">Download</a>' +
-          '<button type="button" class="clip-btn-del" onclick="deleteClip(\'' + clip.id + '\', this)">Delete</button>' +
+          '<a class="clip-btn-dl" href="' + escapeAttr(clip.download_url || '') + '" download="' + escapeAttr((clip.title || 'clip') + (clip.file_ext || '.mp4')) + '">Download</a>' +
+          '<button type="button" class="clip-btn-del" data-clip-id="' + safeId + '">Delete</button>' +
         '</div>' +
       '</div>';
 
-    grid.appendChild(card);
-  });
+    frag.appendChild(card);
+  }
+
+  grid.appendChild(frag);
 }
 
 async function deleteClip(id, btnEl) {
@@ -3430,13 +4446,16 @@ function formatFileSize(bytes) {
 }
 
 function escapeHtml(str) {
-  const div = document.createElement('div');
-  div.textContent = str;
-  return div.innerHTML;
+  return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
 }
 
 function escapeAttr(str) {
-  return str.replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/'/g,'&#39;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  return String(str).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/'/g,'&#39;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+// UUID validation for clip IDs (security: prevent injection in data attributes)
+function isValidUUID(str) {
+  return /^[a-f0-9-]{36}$/.test(str);
 }
 
 // ── Quality/Format Pill Handlers ────────────
@@ -3462,17 +4481,374 @@ function updateQualityPills() {
 function updateFormatPills() {
   document.querySelectorAll('#formatGroup .format-pill').forEach(p =>
     p.classList.toggle('active', p.dataset.f === currentFormat));
-  // MP3: hide quality row + hide trim section
   const qRow = document.querySelector('#qualityGroup').parentElement;
-  if (currentFormat === 'mp3') {
+  const exportRow = document.getElementById('exportRow');
+  const subtitleRow = document.getElementById('subtitleRow');
+  const gifNote = document.getElementById('gifNote');
+  const hideExtras = currentFormat === 'mp3' || currentFormat === 'gif';
+
+  if (currentFormat === 'mp3' || currentFormat === 'gif') {
     qRow.style.display = 'none';
-    if (currentMode === 'trim') setMode('download');
-    document.getElementById('modeTrim').style.display = 'none';
+    if (currentMode === 'trim' && currentFormat === 'mp3') setMode('download');
+    if (currentFormat === 'mp3') document.getElementById('modeTrim').style.display = 'none';
+    if (currentFormat === 'gif') document.getElementById('modeTrim').style.display = '';
   } else {
     qRow.style.display = '';
     document.getElementById('modeTrim').style.display = '';
   }
+
+  // Hide export + subtitles for MP3/GIF
+  exportRow.style.display = hideExtras ? 'none' : '';
+  subtitleRow.style.display = hideExtras ? 'none' : '';
+
+  // Hide editor for MP3
+  const editorPanel = document.getElementById('editorPanel');
+  if (currentFormat === 'mp3') {
+    editorPanel.classList.remove('visible');
+  } else if (document.getElementById('previewSection').classList.contains('visible')) {
+    editorPanel.classList.add('visible');
+  }
+  gifNote.classList.toggle('visible', currentFormat === 'gif');
+
+  // Reset resize/subtitles when switching to MP3/GIF
+  if (hideExtras) {
+    currentResize = '';
+    currentSubtitles = false;
+    document.getElementById('subtitleCheck').checked = false;
+    updateExportPills();
+  }
 }
+
+// ── Export Pill Handlers ────────────────────
+document.querySelectorAll('#exportGroup .export-pill').forEach(btn => {
+  btn.addEventListener('click', () => {
+    currentResize = btn.dataset.r;
+    updateExportPills();
+  });
+});
+
+function updateExportPills() {
+  document.querySelectorAll('#exportGroup .export-pill').forEach(p =>
+    p.classList.toggle('active', p.dataset.r === currentResize));
+}
+
+// ── Subtitle Toggle ────────────────────────
+document.getElementById('subtitleCheck').addEventListener('change', function() {
+  currentSubtitles = this.checked;
+});
+
+// ── Video Editor ───────────────────────────
+function toggleEditorPanel() {
+  editorCollapsed = !editorCollapsed;
+  document.getElementById('editorContent').classList.toggle('collapsed', editorCollapsed);
+  document.getElementById('editorToggleIcon').classList.toggle('collapsed', editorCollapsed);
+}
+
+function getEffectsPayload() {
+  const s = editorState;
+  const effects = {};
+  let hasChanges = false;
+
+  if (s.speed !== 1.0) { effects.speed = s.speed; hasChanges = true; }
+  if (s.volume !== 1.0) { effects.volume = s.volume; hasChanges = true; }
+  if (s.rotate !== 'none') { effects.rotate = s.rotate; hasChanges = true; }
+  if (s.flip !== 'none') { effects.flip = s.flip; hasChanges = true; }
+  if (s.fade_in > 0) { effects.fade_in = s.fade_in; hasChanges = true; }
+  if (s.fade_out > 0) { effects.fade_out = s.fade_out; hasChanges = true; }
+  if (s.brightness !== 0) { effects.brightness = s.brightness; hasChanges = true; }
+  if (s.contrast !== 1.0) { effects.contrast = s.contrast; hasChanges = true; }
+  if (s.saturation !== 1.0) { effects.saturation = s.saturation; hasChanges = true; }
+  if (s.hue !== 0) { effects.hue = s.hue; hasChanges = true; }
+  if (s.temperature !== 0) { effects.temperature = s.temperature; hasChanges = true; }
+  if (s.filter_preset !== 'none') { effects.filter_preset = s.filter_preset; hasChanges = true; }
+
+  // Text overlays
+  const text = document.getElementById('editorTextInput').value.trim();
+  if (text) {
+    const pos = document.querySelector('#editorPosGrid .editor-pos-cell.active');
+    effects.text_overlays = [{
+      text: text,
+      position: pos ? pos.dataset.pos : 'center',
+      fontsize: parseInt(document.getElementById('editorFontSize').value),
+      color: document.getElementById('editorTextColor').value,
+    }];
+    hasChanges = true;
+  }
+
+  return hasChanges ? effects : null;
+}
+
+function resetEditorState() {
+  editorState = {
+    speed: 1.0, volume: 1.0, rotate: 'none', flip: 'none',
+    fade_in: 0, fade_out: 0, brightness: 0, contrast: 1.0,
+    saturation: 1.0, hue: 0, temperature: 0, filter_preset: 'none',
+    text_overlays: []
+  };
+
+  // Reset sliders
+  document.getElementById('editorSpeed').value = 100;
+  document.getElementById('editorSpeedVal').textContent = '1.0x';
+  document.getElementById('editorVolume').value = 100;
+  document.getElementById('editorVolumeVal').textContent = '100%';
+  document.getElementById('editorFadeIn').value = 0;
+  document.getElementById('editorFadeInVal').textContent = '0.0s';
+  document.getElementById('editorFadeOut').value = 0;
+  document.getElementById('editorFadeOutVal').textContent = '0.0s';
+  document.getElementById('editorBrightness').value = 0;
+  document.getElementById('editorBrightnessVal').textContent = '0';
+  document.getElementById('editorContrast').value = 100;
+  document.getElementById('editorContrastVal').textContent = '100';
+  document.getElementById('editorSaturation').value = 100;
+  document.getElementById('editorSaturationVal').textContent = '100';
+  document.getElementById('editorHue').value = 0;
+  document.getElementById('editorHueVal').innerHTML = '0&deg;';
+  document.getElementById('editorTemperature').value = 0;
+  document.getElementById('editorTemperatureVal').textContent = '0';
+
+  // Reset pills
+  document.querySelectorAll('[data-speed]').forEach(p => p.classList.toggle('active', p.dataset.speed === '1'));
+  document.querySelectorAll('#filterPresetGroup .editor-pill').forEach(p => p.classList.toggle('active', p.dataset.filter === 'none'));
+
+  // Reset transform buttons
+  document.querySelectorAll('.editor-icon-btn').forEach(b => b.classList.remove('active'));
+
+  // Reset mute
+  document.getElementById('editorMuteBtn').classList.remove('active');
+  document.getElementById('editorMuteBtn').innerHTML = '&#128266;';
+
+  // Reset text overlay
+  document.getElementById('editorTextInput').value = '';
+  document.getElementById('editorFontSize').value = 48;
+  document.getElementById('editorFontSizeVal').textContent = '48px';
+  document.getElementById('editorTextColor').value = '#FFFFFF';
+  document.querySelectorAll('#editorPosGrid .editor-pos-cell').forEach(c => c.classList.toggle('active', c.dataset.pos === 'center'));
+
+  updateCSSPreview();
+  updateTextPreview();
+}
+
+function updateCSSPreview() {
+  const pw = document.getElementById('playerWrap');
+  if (!pw) return;
+  const b = 1 + editorState.brightness;
+  const c = editorState.contrast;
+  const s = editorState.saturation;
+  const h = editorState.hue;
+  const t = editorState.temperature;
+
+  let filters = [];
+  if (b !== 1) filters.push('brightness(' + b + ')');
+  if (c !== 1) filters.push('contrast(' + c + ')');
+  if (s !== 1) filters.push('saturate(' + s + ')');
+  if (h !== 0) filters.push('hue-rotate(' + h + 'deg)');
+  // Temperature approximation: warm = sepia + slight hue shift
+  if (t > 0) {
+    filters.push('sepia(' + (t * 0.4) + ')');
+    filters.push('hue-rotate(-10deg)');
+  } else if (t < 0) {
+    filters.push('sepia(' + (Math.abs(t) * 0.2) + ')');
+    filters.push('hue-rotate(180deg)');
+    filters.push('saturate(' + (1 + Math.abs(t) * 0.3) + ')');
+  }
+
+  pw.style.filter = filters.length ? filters.join(' ') : '';
+}
+
+function updateTextPreview() {
+  const overlay = document.getElementById('textPreviewOverlay');
+  if (!overlay) return;
+  overlay.innerHTML = '';
+
+  const text = document.getElementById('editorTextInput').value.trim();
+  if (!text) return;
+
+  const pos = document.querySelector('#editorPosGrid .editor-pos-cell.active');
+  const position = pos ? pos.dataset.pos : 'center';
+  const fontSize = document.getElementById('editorFontSize').value;
+  const color = document.getElementById('editorTextColor').value;
+
+  const el = document.createElement('div');
+  el.className = 'text-preview-item';
+  el.textContent = text;
+  el.style.fontSize = fontSize + 'px';
+  el.style.color = color;
+
+  // Position mapping
+  const posMap = {
+    'top-left':      { top: '5%', left: '3%' },
+    'top-center':    { top: '5%', left: '50%', transform: 'translateX(-50%)' },
+    'top-right':     { top: '5%', right: '3%' },
+    'center-left':   { top: '50%', left: '3%', transform: 'translateY(-50%)' },
+    'center':        { top: '50%', left: '50%', transform: 'translate(-50%,-50%)' },
+    'center-right':  { top: '50%', right: '3%', transform: 'translateY(-50%)' },
+    'bottom-left':   { bottom: '5%', left: '3%' },
+    'bottom-center': { bottom: '5%', left: '50%', transform: 'translateX(-50%)' },
+    'bottom-right':  { bottom: '5%', right: '3%' },
+  };
+
+  const p = posMap[position] || posMap['center'];
+  Object.assign(el.style, p);
+  overlay.appendChild(el);
+}
+
+function setEditorSpeed(val) {
+  editorState.speed = val;
+  document.getElementById('editorSpeed').value = val * 100;
+  document.getElementById('editorSpeedVal').textContent = val + 'x';
+  document.querySelectorAll('[data-speed]').forEach(p => p.classList.toggle('active', parseFloat(p.dataset.speed) === val));
+}
+
+function toggleEditorMute() {
+  const btn = document.getElementById('editorMuteBtn');
+  if (editorState.volume > 0) {
+    editorState._prevVolume = editorState.volume;
+    editorState.volume = 0;
+    document.getElementById('editorVolume').value = 0;
+    document.getElementById('editorVolumeVal').textContent = '0%';
+    btn.classList.add('active');
+    btn.innerHTML = '&#128263;';
+  } else {
+    editorState.volume = editorState._prevVolume || 1.0;
+    document.getElementById('editorVolume').value = editorState.volume * 100;
+    document.getElementById('editorVolumeVal').textContent = Math.round(editorState.volume * 100) + '%';
+    btn.classList.remove('active');
+    btn.innerHTML = '&#128266;';
+  }
+}
+
+function setEditorRotate(val) {
+  editorState.rotate = (editorState.rotate === val) ? 'none' : val;
+  document.getElementById('btnRotCW').classList.toggle('active', editorState.rotate === 'cw');
+  document.getElementById('btnRotCCW').classList.toggle('active', editorState.rotate === 'ccw');
+  document.getElementById('btnRot180').classList.toggle('active', editorState.rotate === '180');
+}
+
+function setEditorFlip(val) {
+  if (editorState.flip === val) {
+    editorState.flip = 'none';
+  } else if (editorState.flip === 'none') {
+    editorState.flip = val;
+  } else if (editorState.flip !== val) {
+    editorState.flip = 'hv';
+  }
+  if (editorState.flip === 'hv' && val === 'h') editorState.flip = 'v';
+  else if (editorState.flip === 'hv' && val === 'v') editorState.flip = 'h';
+
+  document.getElementById('btnFlipH').classList.toggle('active', editorState.flip === 'h' || editorState.flip === 'hv');
+  document.getElementById('btnFlipV').classList.toggle('active', editorState.flip === 'v' || editorState.flip === 'hv');
+}
+
+const FILTER_PRESETS_JS = {
+  none:    { brightness: 0, contrast: 1.0, saturation: 1.0, hue: 0, temperature: 0 },
+  warm:    { brightness: 0.05, contrast: 1.1, saturation: 1.2, hue: 0, temperature: 0.4 },
+  cool:    { brightness: 0, contrast: 1.05, saturation: 1.1, hue: 0, temperature: -0.4 },
+  vintage: { brightness: 0.1, contrast: 0.9, saturation: 0.7, hue: 30, temperature: 0.3 },
+  bw:      { brightness: 0, contrast: 1.2, saturation: 0, hue: 0, temperature: 0 },
+  vivid:   { brightness: 0.05, contrast: 1.3, saturation: 1.8, hue: 0, temperature: 0 },
+  cinema:  { brightness: -0.05, contrast: 1.2, saturation: 0.85, hue: 10, temperature: 0.15 },
+};
+
+function setFilterPreset(name) {
+  editorState.filter_preset = name;
+  const p = FILTER_PRESETS_JS[name];
+  if (!p) return;
+
+  editorState.brightness = p.brightness;
+  editorState.contrast = p.contrast;
+  editorState.saturation = p.saturation;
+  editorState.hue = p.hue;
+  editorState.temperature = p.temperature;
+
+  // Update sliders to reflect preset values
+  document.getElementById('editorBrightness').value = Math.round(p.brightness * 100);
+  document.getElementById('editorBrightnessVal').textContent = Math.round(p.brightness * 100);
+  document.getElementById('editorContrast').value = Math.round(p.contrast * 100);
+  document.getElementById('editorContrastVal').textContent = Math.round(p.contrast * 100);
+  document.getElementById('editorSaturation').value = Math.round(p.saturation * 100);
+  document.getElementById('editorSaturationVal').textContent = Math.round(p.saturation * 100);
+  document.getElementById('editorHue').value = p.hue;
+  document.getElementById('editorHueVal').innerHTML = p.hue + '&deg;';
+  document.getElementById('editorTemperature').value = Math.round(p.temperature * 100);
+  document.getElementById('editorTemperatureVal').textContent = Math.round(p.temperature * 100);
+
+  // Update pills
+  document.querySelectorAll('#filterPresetGroup .editor-pill').forEach(el => el.classList.toggle('active', el.dataset.filter === name));
+
+  updateCSSPreview();
+}
+
+// Editor slider event listeners
+document.getElementById('editorSpeed').addEventListener('input', function() {
+  editorState.speed = this.value / 100;
+  document.getElementById('editorSpeedVal').textContent = editorState.speed.toFixed(1) + 'x';
+  document.querySelectorAll('[data-speed]').forEach(p => p.classList.toggle('active', parseFloat(p.dataset.speed) === editorState.speed));
+});
+
+document.getElementById('editorVolume').addEventListener('input', function() {
+  editorState.volume = this.value / 100;
+  document.getElementById('editorVolumeVal').textContent = Math.round(this.value) + '%';
+  const btn = document.getElementById('editorMuteBtn');
+  if (editorState.volume === 0) { btn.classList.add('active'); btn.innerHTML = '&#128263;'; }
+  else { btn.classList.remove('active'); btn.innerHTML = '&#128266;'; }
+});
+
+document.getElementById('editorFadeIn').addEventListener('input', function() {
+  editorState.fade_in = this.value / 10;
+  document.getElementById('editorFadeInVal').textContent = editorState.fade_in.toFixed(1) + 's';
+});
+
+document.getElementById('editorFadeOut').addEventListener('input', function() {
+  editorState.fade_out = this.value / 10;
+  document.getElementById('editorFadeOutVal').textContent = editorState.fade_out.toFixed(1) + 's';
+});
+
+document.getElementById('editorBrightness').addEventListener('input', function() {
+  editorState.brightness = this.value / 100;
+  document.getElementById('editorBrightnessVal').textContent = this.value;
+  updateCSSPreview();
+});
+
+document.getElementById('editorContrast').addEventListener('input', function() {
+  editorState.contrast = this.value / 100;
+  document.getElementById('editorContrastVal').textContent = this.value;
+  updateCSSPreview();
+});
+
+document.getElementById('editorSaturation').addEventListener('input', function() {
+  editorState.saturation = this.value / 100;
+  document.getElementById('editorSaturationVal').textContent = this.value;
+  updateCSSPreview();
+});
+
+document.getElementById('editorHue').addEventListener('input', function() {
+  editorState.hue = parseInt(this.value);
+  document.getElementById('editorHueVal').innerHTML = this.value + '&deg;';
+  updateCSSPreview();
+});
+
+document.getElementById('editorTemperature').addEventListener('input', function() {
+  editorState.temperature = this.value / 100;
+  document.getElementById('editorTemperatureVal').textContent = this.value;
+  updateCSSPreview();
+});
+
+// Text overlay events
+document.getElementById('editorTextInput').addEventListener('input', updateTextPreview);
+document.getElementById('editorFontSize').addEventListener('input', function() {
+  document.getElementById('editorFontSizeVal').textContent = this.value + 'px';
+  updateTextPreview();
+});
+document.getElementById('editorTextColor').addEventListener('input', updateTextPreview);
+
+// Position grid clicks
+document.querySelectorAll('#editorPosGrid .editor-pos-cell').forEach(cell => {
+  cell.addEventListener('click', function() {
+    document.querySelectorAll('#editorPosGrid .editor-pos-cell').forEach(c => c.classList.remove('active'));
+    this.classList.add('active');
+    updateTextPreview();
+  });
+});
 
 // ── Toast Notifications ────────────────────
 function showToast(message, type = 'info', duration = 3500) {
@@ -3734,17 +5110,74 @@ function logout() {
 
 function updateUserUI() {
   const area = document.getElementById('userArea');
+  area.textContent = '';
   const state = getAuthState();
   if (state?.user) {
-    area.innerHTML = '<div class="user-bar"><span class="user-email">' + escapeHtml(state.user.email) + '</span><button type="button" class="btn-logout" onclick="logout()">Log out</button></div>';
+    const bar = document.createElement('div');
+    bar.className = 'user-bar';
+    const emailSpan = document.createElement('span');
+    emailSpan.className = 'user-email';
+    emailSpan.textContent = state.user.email;
+    const logoutBtn = document.createElement('button');
+    logoutBtn.type = 'button';
+    logoutBtn.className = 'btn-logout';
+    logoutBtn.textContent = 'Log out';
+    logoutBtn.addEventListener('click', logout);
+    bar.appendChild(emailSpan);
+    bar.appendChild(logoutBtn);
+    area.appendChild(bar);
   } else {
-    area.innerHTML = '<button type="button" class="btn-login-header" onclick="showAuthModal(\'login\')">Log in</button>';
+    const loginBtn = document.createElement('button');
+    loginBtn.type = 'button';
+    loginBtn.className = 'btn-login-header';
+    loginBtn.textContent = 'Log in';
+    loginBtn.addEventListener('click', () => showAuthModal('login'));
+    area.appendChild(loginBtn);
   }
 }
 
 // Handle Enter key in auth inputs
 document.getElementById('authPassword').addEventListener('keydown', e => {
   if (e.key === 'Enter') submitAuth();
+});
+
+// ── Event Delegation: Library Grid ──────────
+document.getElementById('libraryGrid').addEventListener('click', function(e) {
+  const target = e.target;
+
+  // Checkbox click
+  const checkbox = target.closest('.clip-checkbox');
+  if (checkbox) {
+    e.stopPropagation();
+    const clipId = checkbox.dataset.clipId;
+    if (clipId && isValidUUID(clipId)) onClipSelectChange(clipId);
+    return;
+  }
+
+  // Favorite click
+  const favBtn = target.closest('.clip-favorite');
+  if (favBtn) {
+    e.stopPropagation();
+    const clipId = favBtn.dataset.clipId;
+    if (clipId && isValidUUID(clipId)) toggleFavorite(clipId);
+    return;
+  }
+
+  // Edit title click
+  const titleEl = target.closest('.clip-title-edit');
+  if (titleEl) {
+    const clipId = titleEl.dataset.clipId;
+    if (clipId && isValidUUID(clipId)) openEditModal(clipId);
+    return;
+  }
+
+  // Delete button click
+  const delBtn = target.closest('.clip-btn-del');
+  if (delBtn) {
+    const clipId = delBtn.dataset.clipId;
+    if (clipId && isValidUUID(clipId)) deleteClip(clipId, delBtn);
+    return;
+  }
 });
 
 // ── Init ────────────────────────────────────
