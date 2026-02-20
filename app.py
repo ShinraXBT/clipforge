@@ -191,6 +191,18 @@ def time_to_seconds(time_str):
     return max(0, min(secs, 36000))  # clamp to 10 hours max
 
 
+def _detect_js_runtimes():
+    """Detect if yt-dlp supports js_runtimes option (2025+)."""
+    try:
+        ydl = yt_dlp.YoutubeDL({"quiet": True, "js_runtimes": {"node": {}, "deno": {}}})
+        ydl.close()
+        return {"node": {}, "deno": {}}
+    except Exception:
+        return None
+
+_JS_RUNTIMES = _detect_js_runtimes()
+
+
 def safe_ydl_opts(extra_opts=None):
     """Base yt-dlp options with security hardening."""
     opts = {
@@ -207,9 +219,10 @@ def safe_ydl_opts(extra_opts=None):
         # Prevent loading config files from disk
         "ignoreerrors": False,
         "no_config": True,
-        # Enable Node.js runtime for YouTube signature decoding (required since yt-dlp 2025+)
-        "js_runtimes": "nodejs,deno",
     }
+    # Enable Node.js runtime for YouTube signature decoding (yt-dlp 2025+)
+    if _JS_RUNTIMES:
+        opts["js_runtimes"] = _JS_RUNTIMES
     if extra_opts:
         opts.update(extra_opts)
     return opts
