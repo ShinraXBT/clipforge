@@ -1,4 +1,4 @@
 flask
-yt-dlp
+yt-dlp>=2025.2.19
 supabase
 PyJWT
