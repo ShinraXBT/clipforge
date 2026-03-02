@@ -179,7 +179,7 @@ def extract_video_id(url):
 
 
 def youtube_video_info_fallback(url, video_id):
-    """Fetch YouTube video info via oEmbed API + HTML scraping. Bypasses bot detection."""
+    """Fetch YouTube video info via oEmbed API + innertube API. Bypasses bot detection."""
     info = {}
 
     # 1) oEmbed API — title, channel, thumbnail (never blocked, official API)
@@ -195,18 +195,26 @@ def youtube_video_info_fallback(url, video_id):
         logger.warning("oEmbed fallback failed: %s", str(e)[:200])
         return None
 
-    # 2) HTML scrape — duration (lengthSeconds from page JSON)
-    try:
-        page_req = urllib.request.Request(url, headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-            "Accept-Language": "en-US,en;q=0.9",
-        })
-        with urllib.request.urlopen(page_req, timeout=10) as resp:
-            html = resp.read().decode("utf-8", errors="ignore")
-        m = re.search(r'"lengthSeconds":"(\d+)"', html)
-        info["duration"] = int(m.group(1)) if m else 0
-    except Exception as e:
-        logger.warning("YouTube HTML scrape failed: %s", str(e)[:200])
+    # 2) Innertube WEB API — duration (works from datacenter IPs, returns videoDetails)
+    if video_id:
+        try:
+            payload = json.dumps({
+                "videoId": video_id,
+                "context": {"client": {"clientName": "WEB", "clientVersion": "2.20240101.00.00"}}
+            }).encode("utf-8")
+            api_req = urllib.request.Request(
+                "https://www.youtube.com/youtubei/v1/player?prettyPrint=false",
+                data=payload,
+                headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"},
+            )
+            with urllib.request.urlopen(api_req, timeout=10) as resp:
+                result = json.loads(resp.read().decode("utf-8"))
+            details = result.get("videoDetails", {})
+            info["duration"] = int(details.get("lengthSeconds", 0))
+        except Exception as e:
+            logger.warning("Innertube duration fallback failed: %s", str(e)[:200])
+            info["duration"] = 0
+    else:
         info["duration"] = 0
 
     # Use high-res thumbnail if we have the video ID
