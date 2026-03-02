@@ -819,11 +819,11 @@ def video_info():
             "channel": info.get("uploader") or info.get("uploader_id") or "Unknown",
         })
     except yt_dlp.utils.DownloadError as e:
-        logger.warning("video-info DownloadError: %s", str(e)[:200])
-        return jsonify({"error": "Could not fetch video info. The URL may be invalid or the video may be unavailable."}), 400
+        logger.warning("video-info DownloadError: %s", str(e)[:500])
+        return jsonify({"error": "Could not fetch video info. The URL may be invalid or the video may be unavailable.", "debug": str(e)[:300]}), 400
     except Exception as e:
-        logger.exception("video-info error: %s", str(e)[:200])
-        return jsonify({"error": f"An unexpected error occurred: {str(e)[:150]}"}), 500
+        logger.exception("video-info error: %s", str(e)[:500])
+        return jsonify({"error": f"An unexpected error occurred: {str(e)[:150]}", "debug": str(e)[:300]}), 500
 
 
 # ── API: Download (full video, no trim) ──────────────────────────────────────
