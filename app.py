@@ -223,6 +223,7 @@ def safe_ydl_opts(extra_opts=None):
     }
     if _YDL_JS_RUNTIMES:
         opts["js_runtimes"] = _YDL_JS_RUNTIMES
+    opts["enable_remote_components"] = ["ejs:github"]
     if extra_opts:
         opts.update(extra_opts)
     return opts
