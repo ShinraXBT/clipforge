@@ -211,9 +211,11 @@ def youtube_video_info_fallback(url, video_id):
                 result = json.loads(resp.read().decode("utf-8"))
             details = result.get("videoDetails", {})
             info["duration"] = int(details.get("lengthSeconds", 0))
+            info["_innertube_status"] = result.get("playabilityStatus", {}).get("status", "unknown")
         except Exception as e:
             logger.warning("Innertube duration fallback failed: %s", str(e)[:200])
             info["duration"] = 0
+            info["_innertube_error"] = str(e)[:200]
     else:
         info["duration"] = 0
 
@@ -844,11 +846,12 @@ def video_info():
     if err:
         return jsonify({"error": err}), 400
 
-    # YouTube: try oEmbed + HTML scraping first (bypasses bot detection on datacenter IPs)
+    # YouTube: try oEmbed + innertube first (bypasses bot detection on datacenter IPs)
     if platform == "youtube":
         yt_id = extract_video_id(url)
         fallback = youtube_video_info_fallback(url, yt_id)
         if fallback:
+            fallback["_method"] = "fallback"
             return jsonify(fallback)
 
     # Non-YouTube platforms (or YouTube fallback failed): use yt-dlp
