@@ -8,14 +8,16 @@ import os
 import re
 import uuid
 import time
+import json
 import subprocess
 import mimetypes
 import shutil
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote
 from flask import Flask, request, jsonify, send_file
 
 import logging
+import urllib.request
 
 import yt_dlp
 from supabase import create_client
@@ -174,6 +176,46 @@ def extract_video_id(url):
         if match:
             return match.group(1)
     return None
+
+
+def youtube_video_info_fallback(url, video_id):
+    """Fetch YouTube video info via oEmbed API + HTML scraping. Bypasses bot detection."""
+    info = {}
+
+    # 1) oEmbed API — title, channel, thumbnail (never blocked, official API)
+    try:
+        oembed_url = f"https://www.youtube.com/oembed?url={quote(url, safe='')}&format=json"
+        req = urllib.request.Request(oembed_url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            info["title"] = data.get("title", "Untitled")
+            info["channel"] = data.get("author_name", "Unknown")
+            info["thumbnail"] = data.get("thumbnail_url", "")
+    except Exception as e:
+        logger.warning("oEmbed fallback failed: %s", str(e)[:200])
+        return None
+
+    # 2) HTML scrape — duration (lengthSeconds from page JSON)
+    try:
+        page_req = urllib.request.Request(url, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            "Accept-Language": "en-US,en;q=0.9",
+        })
+        with urllib.request.urlopen(page_req, timeout=10) as resp:
+            html = resp.read().decode("utf-8", errors="ignore")
+        m = re.search(r'"lengthSeconds":"(\d+)"', html)
+        info["duration"] = int(m.group(1)) if m else 0
+    except Exception as e:
+        logger.warning("YouTube HTML scrape failed: %s", str(e)[:200])
+        info["duration"] = 0
+
+    # Use high-res thumbnail if we have the video ID
+    if video_id:
+        info["thumbnail"] = f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"
+
+    info["id"] = video_id or "unknown"
+    info["platform"] = "youtube"
+    return info
 
 
 def time_to_seconds(time_str):
@@ -794,6 +836,14 @@ def video_info():
     if err:
         return jsonify({"error": err}), 400
 
+    # YouTube: try oEmbed + HTML scraping first (bypasses bot detection on datacenter IPs)
+    if platform == "youtube":
+        yt_id = extract_video_id(url)
+        fallback = youtube_video_info_fallback(url, yt_id)
+        if fallback:
+            return jsonify(fallback)
+
+    # Non-YouTube platforms (or YouTube fallback failed): use yt-dlp
     try:
         opts = safe_ydl_opts({"skip_download": True})
 
@@ -820,10 +870,10 @@ def video_info():
         })
     except yt_dlp.utils.DownloadError as e:
         logger.warning("video-info DownloadError: %s", str(e)[:500])
-        return jsonify({"error": "Could not fetch video info. The URL may be invalid or the video may be unavailable.", "debug": str(e)[:300]}), 400
+        return jsonify({"error": "Could not fetch video info. The URL may be invalid or the video may be unavailable."}), 400
     except Exception as e:
         logger.exception("video-info error: %s", str(e)[:500])
-        return jsonify({"error": f"An unexpected error occurred: {str(e)[:150]}", "debug": str(e)[:300]}), 500
+        return jsonify({"error": f"An unexpected error occurred: {str(e)[:150]}"}), 500
 
 
 # ── API: Download (full video, no trim) ──────────────────────────────────────
