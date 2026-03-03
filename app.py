@@ -3666,7 +3666,7 @@ function setMode(mode) {
     document.getElementById('timelineSection').classList.add('visible');
     btn.textContent = 'Trim & Download';
     note.textContent = 'Max clip length: 10 minutes';
-    if (!videoDuration) { showError('trimError', 'Trim not available — video duration unknown.'); setMode('download'); return; }
+    if (!videoDuration) { note.textContent = 'Duration unknown — type start/end times manually. Max 10 min.'; }
   } else {
     document.getElementById('timelineSection').classList.remove('visible');
     btn.textContent = 'Download Video';
@@ -3686,16 +3686,16 @@ function generateWaveform() {
 }
 
 function updateTimeline() {
-  if (!videoDuration) return;
   const startSec = parseTime(document.getElementById('startInput').value);
   const endSec = parseTime(document.getElementById('endInput').value);
+  document.getElementById('clipDuration').textContent = formatTime(Math.max(0, endSec - startSec));
+  if (!videoDuration) return;
   const startPct = (startSec / videoDuration) * 100;
   const endPct = (endSec / videoDuration) * 100;
   document.getElementById('timelineRegion').style.left = startPct + '%';
   document.getElementById('timelineRegion').style.width = (endPct - startPct) + '%';
   document.getElementById('handleStart').style.left = 'calc(' + startPct + '% - 7px)';
   document.getElementById('handleEnd').style.left = 'calc(' + endPct + '% - 7px)';
-  document.getElementById('clipDuration').textContent = formatTime(Math.max(0, endSec - startSec));
 }
 
 ['handleStart', 'handleEnd'].forEach(id => {
