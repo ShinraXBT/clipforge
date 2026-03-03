@@ -1015,9 +1015,9 @@ def download_full():
             mimetype=mime,
         )
 
-    except yt_dlp.utils.DownloadError:
+    except yt_dlp.utils.DownloadError as e:
         cleanup_job_dir(job_dir)
-        return jsonify({"error": "Download failed. The video may be unavailable or restricted."}), 500
+        return jsonify({"error": f"Download failed: {str(e)[:200]}"}), 500
     except Exception:
         cleanup_job_dir(job_dir)
         logger.exception("download-full error")
@@ -1119,9 +1119,9 @@ def trim_video():
             mimetype=mime,
         )
 
-    except yt_dlp.utils.DownloadError:
+    except yt_dlp.utils.DownloadError as e:
         cleanup_job_dir(job_dir)
-        return jsonify({"error": "Trim failed. The video may be unavailable or the format unsupported."}), 500
+        return jsonify({"error": f"Trim failed: {str(e)[:200]}"}), 500
     except Exception:
         cleanup_job_dir(job_dir)
         logger.exception("trim error")
@@ -1304,9 +1304,9 @@ def save_to_library():
             "id": result["id"],
         })
 
-    except yt_dlp.utils.DownloadError:
+    except yt_dlp.utils.DownloadError as e:
         cleanup_job_dir(job_dir)
-        return jsonify({"error": "Download failed. The video may be unavailable."}), 500
+        return jsonify({"error": f"Download failed: {str(e)[:200]}"}), 500
     except Exception:
         cleanup_job_dir(job_dir)
         logger.exception("save-to-library error")
@@ -2458,40 +2458,7 @@ body::after {
   color: var(--text-primary);
 }
 
-/* ── Save dialog ──────────────────────────── */
-.save-dialog {
-  display: none;
-  margin-top: 16px;
-  text-align: left;
-}
-.save-dialog.visible { display: block; }
-
-.save-dialog label {
-  display: block;
-  font-size: 0.75rem;
-  font-weight: 600;
-  color: var(--text-muted);
-  text-transform: uppercase;
-  letter-spacing: 0.05em;
-  margin-bottom: 6px;
-}
-
-.save-dialog input[type="text"] {
-  width: 100%;
-  background: rgba(0,0,0,0.3);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  padding: 10px 12px;
-  color: var(--text-primary);
-  font-family: inherit;
-  font-size: 0.9rem;
-  font-weight: 500;
-  outline: none;
-  margin-bottom: 12px;
-  transition: border-color var(--transition);
-}
-
-.save-dialog input[type="text"]:focus { border-color: var(--border-focus); }
+/* ── Save dialog (uses .modal styles) ─────── */
 
 .tag-input-wrap {
   display: flex;
@@ -3412,19 +3379,6 @@ body::after {
         <button type="button" class="btn-secondary" onclick="resetAll()">New clip</button>
       </div>
 
-      <!-- Save Dialog -->
-      <div class="save-dialog" id="saveDialog">
-        <label for="saveTitleInput">Title</label>
-        <input type="text" id="saveTitleInput" placeholder="Clip title..." maxlength="200">
-        <label>Tags <span style="font-size:0.65rem;font-weight:400;color:var(--text-muted)">(Enter to add, max 10)</span></label>
-        <div class="tag-input-wrap" id="tagInputWrap" onclick="document.getElementById('tagField').focus()">
-          <input type="text" class="tag-input-field" id="tagField" placeholder="Add a tag...">
-        </div>
-        <div class="save-actions">
-          <button type="button" class="btn-confirm" id="btnConfirmSave" onclick="saveToLibrary()">Confirm & Save</button>
-          <button type="button" class="btn-cancel" onclick="closeSaveDialog()">Cancel</button>
-        </div>
-      </div>
     </div>
   </div>
 
@@ -3475,6 +3429,23 @@ body::after {
         <button type="button" class="bulk-btn bulk-btn-download" onclick="bulkDownload()">Download</button>
         <button type="button" class="bulk-btn bulk-btn-delete" onclick="bulkDelete()">Delete</button>
       </div>
+    </div>
+  </div>
+</div>
+
+<!-- ═══ SAVE MODAL ═══ -->
+<div class="modal-overlay" id="saveModalOverlay" onclick="if(event.target===this)closeSaveDialog()">
+  <div class="modal">
+    <h3>Save to Library</h3>
+    <label for="saveTitleInput">Title</label>
+    <input type="text" id="saveTitleInput" placeholder="Clip title..." maxlength="200">
+    <label>Tags <span style="font-size:0.65rem;font-weight:400;color:var(--text-muted)">(Enter to add, max 10)</span></label>
+    <div class="tag-input-wrap" id="tagInputWrap" onclick="document.getElementById('tagField').focus()">
+      <input type="text" class="tag-input-field" id="tagField" placeholder="Add a tag...">
+    </div>
+    <div class="modal-actions">
+      <button type="button" class="btn-confirm" id="btnConfirmSave" onclick="saveToLibrary()" style="flex:1">Confirm & Save</button>
+      <button type="button" class="btn-cancel" onclick="closeSaveDialog()">Cancel</button>
     </div>
   </div>
 </div>
@@ -3880,14 +3851,13 @@ document.getElementById('subtitleCheck').addEventListener('change', function() {
 
 // ── Save Dialog ────────────────────────────
 function openSaveDialog() {
-  const dialog = document.getElementById('saveDialog');
   document.getElementById('saveTitleInput').value = document.getElementById('videoTitle').textContent || '';
   saveTags = []; renderSaveTags();
-  dialog.classList.add('visible');
+  document.getElementById('saveModalOverlay').classList.add('visible');
   document.getElementById('saveTitleInput').focus();
 }
 
-function closeSaveDialog() { document.getElementById('saveDialog').classList.remove('visible'); }
+function closeSaveDialog() { document.getElementById('saveModalOverlay').classList.remove('visible'); }
 
 function renderSaveTags() {
   const wrap = document.getElementById('tagInputWrap');
@@ -3918,7 +3888,7 @@ async function saveToLibrary() {
   const url = document.getElementById('urlInput').value.trim();
   const customTitle = document.getElementById('saveTitleInput').value.trim() || 'Untitled';
   const tagsStr = saveTags.length > 0 ? saveTags.join(',') : null;
-  const body = { url, mode: currentMode, title: customTitle, platform: currentPlatform, thumbnail: document.getElementById('videoThumb').src, channel: document.getElementById('videoChannel').textContent, duration: videoDuration, tags: tagsStr, quality: currentQuality, format: currentFormat, resize: currentResize, subtitles: currentSubtitles };
+  const body = { url, mode: currentMode, title: customTitle, platform: currentPlatform, thumbnail: document.getElementById('videoThumb').getAttribute('src') || '', channel: document.getElementById('videoChannel').textContent, duration: videoDuration, tags: tagsStr, quality: currentQuality, format: currentFormat, resize: currentResize, subtitles: currentSubtitles };
   if (currentMode === 'trim') { body.start = document.getElementById('startInput').value.trim(); body.end = document.getElementById('endInput').value.trim(); }
   try {
     const resp = await authFetch('/api/save-to-library', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
@@ -3948,7 +3918,7 @@ async function loadLibrary(append) {
   try {
     const resp = await authFetch('/api/library?page=' + libraryPage + '&per_page=20');
     const data = await resp.json();
-    allClips = append ? allClips.concat(data.clips || []) : (data.clips || []);
+    if (append) { const ids = new Set(allClips.map(c => c.id)); allClips = allClips.concat((data.clips || []).filter(c => !ids.has(c.id))); } else { allClips = data.clips || []; }
     libraryHasMore = data.has_more || false;
     localStorage.setItem('clipforge_library', JSON.stringify(allClips));
     applyLibraryView();
