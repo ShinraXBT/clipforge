@@ -326,8 +326,16 @@ def safe_ydl_opts(extra_opts=None):
     if _rustypipe_ready:
         opts["extractor_args"] = {
             "youtube": {
+                "player_client": ["mweb", "tv", "web"],
                 "rustypipe_bg_bin": [_RUSTYPIPE_BIN_PATH],
                 "rustypipe_bg_pot_cache": ["1"],
+            }
+        }
+    else:
+        # Even without PO tokens, try tv client first (no PO required on datacenter IPs)
+        opts["extractor_args"] = {
+            "youtube": {
+                "player_client": ["tv", "mweb"],
             }
         }
     if extra_opts:
